@@ -1,0 +1,28 @@
+# Entorno y configuración local
+.env
+.env.*
+!.env.example
+.vscode/
+
+# Datos locales de entrada
+data/pdfs/*
+!data/pdfs/.gitkeep
+data/models/*
+
+# Base vectorial local generada
+data/lancedb/
+
+# Índice BM25
+data/bm25/
+
+# Python generado
+__pycache__/
+*.py[cod]
+
+# Metadata generada por instalación editable
+*.egg-info/
+
+# Otros directorios generados habituales
+build/
+dist/
+.eggs/
