@@ -1,4 +1,6 @@
 fastapi>=0.115.0
+# setup.ps1 instala este pin desde el indice oficial CUDA 13.0 de PyTorch.
+torch==2.12.1
 lancedb>=0.17.0
 langchain-text-splitters>=0.3.0
 marker-pdf>=1.10.2

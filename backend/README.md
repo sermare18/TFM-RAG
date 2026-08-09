@@ -1,235 +1,105 @@
 # RAG Cliente
 
-RAG local para indexar documentos (`PDF`, `DOCX`, `TXT` e imágenes) en LanceDB y consultarlos con endpoints compatibles con OpenAI.
-
-Desde esta versión, los PDFs se procesan con **Marker** como parser/OCR principal. El OCR anterior basado en PaddleX/PaddleOCR se ha eliminado de las dependencias.
+RAG local para indexar PDF, DOCX, TXT e imágenes en LanceDB y consultarlos
+mediante CLI o una API compatible con aplicaciones web. Los PDF e imágenes se
+procesan con Marker; PyTorch y Marker están configurados para una GPU NVIDIA.
 
 ## Requisitos
 
-- Python 3.10+
-- Conda
-- Endpoints de **chat** y **embeddings** compatibles con OpenAI
-- PyTorch compatible con tu equipo, ya sea CPU o GPU, para ejecutar Marker
+- Windows
+- Conda (Miniconda o Anaconda)
+- GPU NVIDIA y driver compatible con CUDA 13
+- Un endpoint de chat compatible con OpenAI
+- Un endpoint de embeddings compatible con OpenAI
 
 ## Instalación
 
+Desde esta carpeta:
+
 ```powershell
-create_conda_env.bat
-conda activate rag-cliente
-python -m pip install -r requirements.txt
-python -m pip install -e .
+.\setup.ps1
+.\rag.bat gpu
 ```
 
-`requirements.txt` instala `marker-pdf`. Si quieres forzar GPU o CPU, ajusta `MARKER_TORCH_DEVICE` en `.env`:
-
-```env
-MARKER_TORCH_DEVICE=cuda
-```
-
-Valores habituales:
-
-- `cuda`: GPU NVIDIA con CUDA disponible
-- `cpu`: CPU
-- `mps`: Apple Silicon
-- vacío: Marker/Torch detecta el dispositivo automáticamente
+`setup.ps1` crea o actualiza el entorno `rag-cliente` con Python 3.11, instala
+PyTorch 2.12.1 con CUDA 13.0, instala las dependencias y el paquete local, y
+comprueba que CUDA sea visible. La instalación falla si PyTorch no detecta la
+GPU; no se usa CPU como fallback.
 
 ## Configuración
 
-Crea un `.env` en la raíz. Puedes partir de `.env.example`.
-
-Ejemplo mínimo:
+Copia `.env.example` como `.env` y ajusta, como mínimo:
 
 ```env
-# Endpoints
-LLAMA_CPP_CHAT_BASE_URL=http://10.31.2.6:8080/v1
-LLAMA_CPP_EMBEDDING_BASE_URL=http://10.31.2.6:8080/v1
+LLAMA_CPP_CHAT_BASE_URL=http://127.0.0.1:8081/v1
+LLAMA_CPP_EMBEDDING_BASE_URL=http://127.0.0.1:8082/v1
 OPENAI_API_KEY=local-dev-key
+MARKER_TORCH_DEVICE=cuda
+```
 
-# LanceDB
+Las opciones principales de almacenamiento y recuperación son:
+
+```env
 LANCEDB_URI=./data/lancedb
 LANCEDB_TABLE=pdf_chunks
-
-# Parámetros de RAG
+DOCUMENTS_DIR=./data/pdfs
 TOP_K=4
 CHUNK_SIZE=700
 CHUNK_OVERLAP=100
-MAX_TOKENS=1024
-REQUEST_TIMEOUT=300
-EMBEDDING_BATCH_SIZE=16
-DATA_DIR=./data
-DOCUMENTS_DIR=./data/pdfs
-
-# Marker
-MARKER_ENABLED=true
-MARKER_FORCE_OCR=false
-MARKER_STRIP_EXISTING_OCR=false
-MARKER_USE_LLM=false
-MARKER_DISABLE_IMAGE_EXTRACTION=true
-MARKER_PAGE_RANGE=
-MARKER_TORCH_DEVICE=
+HYBRID_SEARCH_ENABLED=true
+VECTOR_WEIGHT=0.65
+BM25_WEIGHT=0.35
 ```
 
-### Variables Marker
-
-| Variable | Uso |
-| --- | --- |
-| `MARKER_ENABLED` | Activa Marker para PDFs e imágenes. Si es `false`, los PDFs digitales se extraen con PyMuPDF como fallback y las imágenes no se indexan. |
-| `MARKER_FORCE_OCR` | Fuerza OCR visual incluso si el PDF tiene texto embebido. Útil si el texto nativo está corrupto o quieres priorizar layout/tablas. |
-| `MARKER_STRIP_EXISTING_OCR` | Elimina una capa OCR existente antes de re-OCR. Útil con PDFs escaneados que traen OCR malo o duplicado. |
-| `MARKER_USE_LLM` | Activa el modo LLM de Marker para mejorar tablas/formularios/formato. Requiere configurar un backend LLM soportado por Marker. |
-| `MARKER_DISABLE_IMAGE_EXTRACTION` | Evita guardar imágenes extraídas en disco. Recomendado para RAG textual. |
-| `MARKER_PAGE_RANGE` | Rango opcional de páginas en sintaxis Marker, por ejemplo `0,5-10,20`. Vacío procesa todo. |
-| `MARKER_TORCH_DEVICE` | Dispositivo opcional para Torch/Marker: `cpu`, `cuda` o `mps`. |
-
-### Variables OCR antiguas obsoletas
-
-Estas variables de PaddleX/PaddleOCR ya no controlan el procesamiento:
-
-```env
-ENABLE_OCR
-OCR_PIPELINE_NAME
-OCR_DEVICE
-OCR_FORCE_FOR_PDF
-OCR_MIN_NATIVE_CHARS
-OCR_MIN_NATIVE_CHARS_PER_PAGE
-OCR_RENDER_DPI
-OCR_USE_TABLE_RECOGNITION
-OCR_USE_FORMULA_RECOGNITION
-OCR_USE_REGION_DETECTION
-OCR_FORMAT_BLOCK_CONTENT
-```
-
-`config.py` las sigue aceptando como obsoletas para que un `.env` antiguo no rompa la carga de configuración, pero `pdf_loader.py` ya no las usa.
-
-## Estructura mínima
-
-```text
-api-python/
-├─ data/
-│  ├─ pdfs/
-│  └─ lancedb/
-├─ src/rag_cliente/
-├─ .env
-├─ requirements.txt
-├─ pyproject.toml
-├─ run_rag_index.bat
-├─ run_rag_ask.bat
-└─ run_lancedb_viewer.bat
-```
+Marker se controla con `MARKER_ENABLED`, `MARKER_FORCE_OCR`,
+`MARKER_STRIP_EXISTING_OCR`, `MARKER_USE_LLM`,
+`MARKER_DISABLE_IMAGE_EXTRACTION` y `MARKER_PAGE_RANGE`.
 
 ## Uso
 
-### 1. Preparar documentos
-
-Coloca tus archivos en:
-
-```text
-data/pdfs
-```
-
-Formatos soportados:
-
-- `.pdf`: procesado con Marker por defecto
-- `.docx`: comportamiento existente con `python-docx`
-- `.txt`: comportamiento existente con lectura UTF-8
-- Imágenes: `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`, `.tiff`, `.webp`, procesadas con Marker si `MARKER_ENABLED=true`
-
-Puedes organizar documentos por etiqueta usando subcarpetas:
-
-```text
-data/pdfs/confidencial/archivo1.pdf
-data/pdfs/publico/archivo2.pdf
-data/pdfs/archivo3.pdf
-```
-
-Al reindexar, el tag se deriva de la primera carpeta relativa: `confidencial`, `publico` o sin tag si el archivo está directamente en `data/pdfs`.
-
-### 2. Indexar por terminal
+Coloca los documentos en `data/pdfs`. Se admiten PDF, DOCX, TXT, PNG, JPG,
+JPEG, BMP, TIF, TIFF y WEBP. Las subcarpetas se usan como etiquetas; por
+ejemplo, `data/pdfs/confidencial/contrato.pdf` recibe el tag `confidencial`.
 
 ```powershell
-python -m rag_cliente.cli index --doc-dir data\pdfs
+# Comprobar la GPU
+.\rag.bat gpu
+
+# Indexar data/pdfs
+.\rag.bat index
+
+# Indexar otra carpeta
+.\rag.bat index "D:\documentos"
+
+# Consultar
+.\rag.bat ask "Resume el contrato"
+
+# Activar thinking solo para esta consulta y mostrar el razonamiento
+.\rag.bat ask "Analiza las alternativas" --stream --show-reasoning
+
+# Arrancar la API en el puerto 8000
+.\rag.bat api
+
+# Arrancar la API en otro puerto
+.\rag.bat api 8088
+
+# Abrir el visor de LanceDB
+.\rag.bat viewer
+
+# Ejecutar los tests
+.\rag.bat test
 ```
 
-Para asignar una etiqueta de metadatos a todos los chunks de esa indexación:
-
-```powershell
-python -m rag_cliente.cli index --doc-dir data\pdfs --tag confidencial
-```
-
-Durante el indexado verás progreso similar a:
-
-```text
-Iniciando indexado en: data\pdfs
-Inicializando Marker...
-Procesando archivo 1/3: contrato.pdf
-Parseando PDF con Marker: contrato.pdf
-Extraídas 12 páginas/bloques de contrato.pdf (OCR usado en 3)
-Chunking de documentos...
-Chunks generados: 84
-Generando embeddings en lotes de 16...
-Embeddings lote 1/6 (16 textos)
-Guardando 84 chunks en LanceDB...
-Indexado completado en tabla 'pdf_chunks'.
-```
-
-También puedes usar el script:
-
-```powershell
-.\run_rag_index.bat
-```
-
-### 3. Preguntar por terminal
-
-```powershell
-python -m rag_cliente.cli ask "Como crear un correo electrónico"
-```
-
-Por defecto, el CLI **no imprime reasoning**, aunque el backend lo devuelva.
-
-### 4. Mostrar reasoning explícitamente
-
-```powershell
-python -m rag_cliente.cli ask "Resume el documento" --show-reasoning
-```
-
-Con streaming:
-
-```powershell
-python -m rag_cliente.cli ask "Resume el documento" --stream --show-reasoning
-```
-
-### 5. Ajustar recuperación
-
-```powershell
-python -m rag_cliente.cli ask "Resume el documento" --top-k 4
-```
-
-Para limitar la recuperación a chunks con una etiqueta concreta:
-
-```powershell
-python -m rag_cliente.cli ask "Resume el contrato" --top-k 8 --tag confidencial
-```
+La API se ejecuta en primer plano y se detiene con `Ctrl+C`. Swagger queda
+disponible en `http://localhost:8000/docs`.
 
 ## API HTTP
-
-El proyecto puede exponerse con FastAPI reutilizando el mismo pipeline:
-
-```powershell
-python -m pip install -r requirements.txt
-python -m pip install -e .
-rag-api
-```
-
-O bien:
-
-```powershell
-uvicorn rag_cliente.api:app --host 0.0.0.0 --port 8000
-```
 
 Endpoints principales:
 
 - `GET /health`
 - `GET /files`
+- `GET /files/{path}`
 - `POST /files/upload`
 - `POST /sessions`
 - `DELETE /sessions/{session_id}`
@@ -237,127 +107,52 @@ Endpoints principales:
 - `POST /ask`
 - `POST /ask/stream`
 
-Documentación interactiva:
-
-- `http://localhost:8000/docs`
-- `http://localhost:8000/redoc`
-
 Ejemplos:
 
 ```powershell
 curl http://localhost:8000/health
-```
 
-```powershell
 curl -X POST http://localhost:8000/index `
   -H "Content-Type: application/json" `
-  -d "{\"doc_dir\":\"data/pdfs\"}"
-```
+  -d '{"doc_dir":"data/pdfs"}'
 
-Con tag:
-
-```powershell
-curl -X POST http://localhost:8000/index `
-  -H "Content-Type: application/json" `
-  -d "{\"doc_dir\":\"data/pdfs\",\"tag\":\"confidencial\"}"
-```
-
-```powershell
 curl -X POST http://localhost:8000/ask `
   -H "Content-Type: application/json" `
-  -d "{\"question\":\"¿Qué dice el documento sobre la renovación?\",\"top_k\":2}"
+  -d '{"question":"Resume el documento","top_k":4}'
 ```
 
-Con filtro por tag:
+`POST /files/upload` admite un campo multipart `tag`. `/ask` acepta `tag` o
+`tags`; si se envían varias etiquetas, se usa la primera no vacía.
+El razonamiento está desactivado por defecto; envía `"enable_reasoning": true`
+en `/ask` o `/ask/stream` para activarlo en una petición concreta.
+En streaming, el reasoning se emite token a token hasta
+`REASONING_MAX_TOKENS` y la respuesta final continúa en el mismo flujo también
+token a token. Esto evita que Qwen3.5 consuma indefinidamente toda la generación
+sin llegar a producir una respuesta.
 
-```powershell
-curl -X POST http://localhost:8000/ask `
-  -H "Content-Type: application/json" `
-  -d "{\"question\":\"Resume el contrato\",\"top_k\":8,\"tag\":\"confidencial\"}"
-```
-
-También se acepta `tags` con una lista y se usará la primera etiqueta no vacía. Si omites `tag`/`tags`, la búsqueda se hace sobre todo el índice como antes. Las tablas LanceDB ya creadas antes de este cambio no tienen la columna `tag`; para filtrar por tag debes reindexar los documentos.
-
-`POST /files/upload` también acepta `tag` como campo `multipart/form-data`. Si envías `tag=confidencial`, el archivo se guarda en `data/pdfs/confidencial/<archivo>`; si no envías tag, se guarda directamente en `data/pdfs/<archivo>`.
-
-## Visor local de LanceDB
-
-```powershell
-.\run_lancedb_viewer.bat
-```
-
-Permite:
-
-- ver tablas
-- inspeccionar chunks
-- ver las columnas `ocr_used` y `tag`
-- filtrar por `source`, `source_type` y `tag`
-- buscar por texto
-
-### Metadatos en LanceDB
-
-Cada chunk guardado en LanceDB incluye ahora estas columnas de metadatos:
+## Estructura
 
 ```text
-ocr_used
-tag
+backend/
+├─ data/
+│  ├─ pdfs/
+│  ├─ lancedb/       # generado
+│  └─ bm25/          # generado
+├─ src/rag_cliente/
+├─ tests/
+├─ .env
+├─ requirements.txt
+├─ pyproject.toml
+├─ setup.ps1
+└─ rag.bat
 ```
 
-Valores:
+## Diagnóstico
 
-- `true`: Marker usó OCR/Surya para la página o unidad de origen del chunk.
-- `false`: el texto procede de extracción nativa del PDF (`pdftext`) o de formatos no OCR como DOCX/TXT.
-- `tag`: etiqueta opcional asignada al indexar, por ejemplo `confidencial`.
+Si CUDA no está disponible, ejecuta otra vez `setup.ps1` y después
+`rag.bat gpu`. Con `MARKER_TORCH_DEVICE=cuda`, el indexador se detiene con un
+mensaje explícito si PyTorch no detecta la GPU.
 
-La columna `ocr_used` se obtiene de `metadata["page_stats"][].text_extraction_method` devuelto por Marker. No se calcula por extensión de archivo ni por una heurística propia del proyecto.
-
-## Scripts
-
-- `create_conda_env.bat`: crea el entorno Conda
-- `activate_conda_env.bat`: activa el entorno
-- `open_rag_terminal.bat`: abre terminal preparada
-- `run_rag_index.bat`: indexa documentos
-- `run_rag_ask.bat`: lanza una pregunta
-- `run_lancedb_viewer.bat`: abre el visor local
-
-## Problemas habituales
-
-### Falta Marker
-
-```powershell
-python -m pip install marker-pdf
-```
-
-O reinstala todas las dependencias:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-### CUDA/GPU no se usa
-
-Comprueba que PyTorch detecta CUDA en tu entorno y fuerza el dispositivo:
-
-```env
-MARKER_TORCH_DEVICE=cuda
-```
-
-### `Table 'pdf_chunks' was not found`
-
-Todavía no has indexado o no existe la carpeta de LanceDB:
-
-```powershell
-python -m rag_cliente.cli index --doc-dir data\pdfs
-```
-
-### `openai.APITimeoutError`
-
-El endpoint tarda demasiado. Sube el timeout en `.env`:
-
-```env
-REQUEST_TIMEOUT=300
-```
-
-### Un PDF concreto falla al indexar
-
-El indexador muestra un aviso y continúa con el resto de archivos. Revisa el mensaje `AVISO: no se pudo procesar ...` para ver la causa.
+Si LanceDB indica que no existe `pdf_chunks`, añade documentos y ejecuta
+`rag.bat index`. Si un endpoint devuelve timeout, aumenta `REQUEST_TIMEOUT` en
+`.env` y comprueba que los servidores de chat y embeddings estén accesibles.

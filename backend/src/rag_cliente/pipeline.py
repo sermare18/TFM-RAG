@@ -496,6 +496,7 @@ class RagPipeline:
         top_k: int | None = None,
         messages: list[dict[str, str]] | None = None,
         tag: str | None = None,
+        enable_reasoning: bool = False,
     ) -> dict[str, Any]:
         """Responde una pregunta usando retrieval + generación no streaming."""
         generation_inputs = self._prepare_generation_inputs(question, top_k=top_k, messages=messages, tag=tag)
@@ -503,6 +504,7 @@ class RagPipeline:
             question,
             generation_inputs["context_blocks"],
             messages=messages,
+            enable_reasoning=enable_reasoning,
         )
         citations = self._select_used_citations(
             question=question,
@@ -523,6 +525,7 @@ class RagPipeline:
         top_k: int | None = None,
         messages: list[dict[str, str]] | None = None,
         tag: str | None = None,
+        enable_reasoning: bool = False,
     ) -> dict[str, Any]:
         """Responde una pregunta en streaming."""
         generation_inputs = self._prepare_generation_inputs(question, top_k=top_k, messages=messages, tag=tag)
@@ -532,11 +535,13 @@ class RagPipeline:
                 question,
                 generation_inputs["context_blocks"],
                 messages=messages,
+                enable_reasoning=enable_reasoning,
             ),
-            "fallback_response": lambda: self.client.generate_answer(
+            "fallback_stream": lambda: self.client.stream_answer(
                 question,
                 generation_inputs["context_blocks"],
                 messages=messages,
+                enable_reasoning=False,
             ),
             "resolve_citations": lambda answer: self._select_used_citations(
                 question=question,

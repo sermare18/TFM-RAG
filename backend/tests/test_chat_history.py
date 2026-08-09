@@ -180,7 +180,7 @@ class ApiChatHistoryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = []
 
-            def ask(self, question, top_k=None, messages=None, tag=None):
+            def ask(self, question, top_k=None, messages=None, tag=None, enable_reasoning=False):
                 self.calls.append(
                     {
                         "question": question,
@@ -251,7 +251,7 @@ class ApiChatHistoryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.called_with = None
 
-            def ask(self, question, top_k=None, messages=None, tag=None):
+            def ask(self, question, top_k=None, messages=None, tag=None, enable_reasoning=False):
                 self.called_with = {
                     "question": question,
                     "top_k": top_k,
@@ -299,7 +299,7 @@ class ApiChatHistoryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.called_with = None
 
-            def ask(self, question, top_k=None, messages=None, tag=None):
+            def ask(self, question, top_k=None, messages=None, tag=None, enable_reasoning=False):
                 self.called_with = {
                     "question": question,
                     "top_k": top_k,
@@ -344,7 +344,7 @@ class ApiChatHistoryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.called_with = None
 
-            def ask(self, question, top_k=None, messages=None, tag=None):
+            def ask(self, question, top_k=None, messages=None, tag=None, enable_reasoning=False):
                 self.called_with = tag
                 return {
                     "answer": "Resumen",
@@ -375,7 +375,14 @@ class ApiChatHistoryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.called_with = None
 
-            def stream_answer(self, question, top_k=None, messages=None, tag=None):
+            def stream_answer(
+                self,
+                question,
+                top_k=None,
+                messages=None,
+                tag=None,
+                enable_reasoning=False,
+            ):
                 self.called_with = {
                     "question": question,
                     "top_k": top_k,
@@ -384,7 +391,9 @@ class ApiChatHistoryTests(unittest.TestCase):
                 }
                 return {
                     "answer_stream": iter(()),
-                    "fallback_response": lambda: {"answer": "Ana", "reasoning": ""},
+                    "fallback_stream": lambda: iter(
+                        [{"type": "answer", "delta": "Ana"}]
+                    ),
                     "resolve_citations": lambda answer: [],
                     "matches": [],
                 }
@@ -417,7 +426,11 @@ class ApiChatHistoryTests(unittest.TestCase):
         )
         events = [json.loads(line) for line in response.text.strip().splitlines()]
         self.assertEqual(events[0], {"type": "session", "session_id": response.headers["x-session-id"]})
-        self.assertEqual(events[1], {"type": "answer", "delta": "Ana"})
+        self.assertEqual(
+            events[1],
+            {"type": "fallback", "reason": "reasoning_finished_without_answer"},
+        )
+        self.assertEqual(events[2], {"type": "answer", "delta": "Ana"})
 
     def test_create_and_delete_session_endpoints(self) -> None:
         app = create_app()
@@ -450,6 +463,50 @@ class ApiChatHistoryTests(unittest.TestCase):
 
 
 class PromptConstructionTests(unittest.TestCase):
+    def test_reasoning_stream_continues_with_streamed_final_answer(self) -> None:
+        client = LlamaCppClient(Settings())
+        client.chat_client = Mock()
+
+        reasoning_chunk = types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    delta=types.SimpleNamespace(content=None, reasoning_content="analisis"),
+                    text=None,
+                )
+            ]
+        )
+        answer_chunk = types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    delta=types.SimpleNamespace(content="respuesta", reasoning_content=None),
+                    text=None,
+                )
+            ]
+        )
+        client.chat_client.chat.completions.create.side_effect = [
+            iter([reasoning_chunk]),
+            iter([answer_chunk]),
+        ]
+
+        events = list(
+            client.stream_answer(
+                "pregunta",
+                ["contexto"],
+                enable_reasoning=True,
+            )
+        )
+
+        self.assertEqual(
+            events,
+            [
+                {"type": "reasoning", "delta": "analisis"},
+                {"type": "answer", "delta": "respuesta"},
+            ],
+        )
+        calls = client.chat_client.chat.completions.create.call_args_list
+        self.assertEqual(calls[0].kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"], True)
+        self.assertEqual(calls[1].kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"], False)
+
     def test_build_messages_includes_history_and_retrieved_context(self) -> None:
         question = "Como me llamo?"
         history = [
@@ -552,7 +609,6 @@ class PipelineChatHistoryTests(unittest.TestCase):
 
         ask_result = pipeline.ask("Como me llamo?", top_k=3, messages=history)
         stream_result = pipeline.stream_answer("Como me llamo?", top_k=3, messages=history)
-        fallback_result = stream_result["fallback_response"]()
 
         expected_context = ["[S1] chat.txt p.1-1\nAna dijo que se llama Ana."]
 
@@ -570,13 +626,15 @@ class PipelineChatHistoryTests(unittest.TestCase):
             "Como me llamo?",
             expected_context,
             messages=history,
+            enable_reasoning=False,
         )
         pipeline.client.stream_answer.assert_called_once_with(
             "Como me llamo?",
             expected_context,
             messages=history,
+            enable_reasoning=False,
         )
-        self.assertEqual(fallback_result["answer"], "Ana")
+        self.assertIn("fallback_stream", stream_result)
         self.assertEqual(ask_result["citations"][0]["document_id"], "doc-1")
         self.assertEqual(stream_result["resolve_citations"]("Ana")[0]["document_id"], "doc-1")
 

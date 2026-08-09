@@ -238,10 +238,25 @@ def create_marker_converter(settings: Settings) -> Any:
     Raises:
         RuntimeError: Si `marker-pdf` no está instalado o no puede inicializarse.
     """
-    if settings.marker_torch_device.strip():
+    marker_device = settings.marker_torch_device.strip().lower()
+    if marker_device:
         # Marker documenta TORCH_DEVICE como mecanismo para forzar cpu/cuda/mps.
         # Se fija antes de importar Marker para que torch lo vea al inicializar.
-        os.environ.setdefault("TORCH_DEVICE", settings.marker_torch_device.strip())
+        os.environ["TORCH_DEVICE"] = marker_device
+
+    if marker_device == "cuda":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "PyTorch no esta instalado. Ejecuta setup.ps1 para instalar la version CUDA."
+            ) from exc
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "MARKER_TORCH_DEVICE=cuda, pero PyTorch no detecta la GPU. "
+                "Ejecuta setup.ps1 y comprueba el resultado con 'rag.bat gpu'."
+            )
 
     try:
         from marker.config.parser import ConfigParser

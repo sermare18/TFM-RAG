@@ -60,6 +60,7 @@ class AskRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
     session_id: str | None = Field(default=None, min_length=1)
     messages: list[ChatMessage] = Field(default_factory=list)
+    enable_reasoning: bool = False
 
 
 class Citation(BaseModel):
@@ -355,6 +356,7 @@ def create_app() -> FastAPI:
                 top_k=payload.top_k,
                 messages=combined_messages,
                 tag=tag,
+                enable_reasoning=payload.enable_reasoning,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -388,6 +390,7 @@ def create_app() -> FastAPI:
                 top_k=payload.top_k,
                 messages=combined_messages,
                 tag=tag,
+                enable_reasoning=payload.enable_reasoning,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -411,13 +414,13 @@ def create_app() -> FastAPI:
                     emitted_reasoning = True
                 yield serialize_event(event)
 
-            if not emitted_answer and not emitted_reasoning:
-                fallback_response = result["fallback_response"]()
-                if fallback_response["reasoning"]:
-                    yield serialize_event({"type": "reasoning", "delta": fallback_response["reasoning"]})
-                if fallback_response["answer"]:
-                    collected_answer_parts.append(fallback_response["answer"])
-                    yield serialize_event({"type": "answer", "delta": fallback_response["answer"]})
+            if not emitted_answer:
+                yield serialize_event({"type": "fallback", "reason": "reasoning_finished_without_answer"})
+                for event in result["fallback_stream"]():
+                    if event["type"] == "answer":
+                        emitted_answer = True
+                        collected_answer_parts.append(event["delta"])
+                        yield serialize_event(event)
 
             app.state.session_store.append_messages(
                 session_id,

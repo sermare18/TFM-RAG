@@ -22,9 +22,11 @@ Sergio y Juan
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Carga variables de entorno desde ".env" antes de construir Settings.
@@ -40,11 +42,11 @@ class Settings(BaseSettings):
     default_endpoint_model: str = "default"
 
     llama_cpp_chat_base_url: str = Field(
-        default="http://localhost:8080/v1",
+        default="http://127.0.0.1:8081/v1",
         alias="LLAMA_CPP_CHAT_BASE_URL",
     )
     llama_cpp_embedding_base_url: str = Field(
-        default="http://localhost:8081/v1",
+        default="http://127.0.0.1:8082/v1",
         alias="LLAMA_CPP_EMBEDDING_BASE_URL",
     )
     openai_api_key: str = Field(default="local-dev-key", alias="OPENAI_API_KEY")
@@ -79,7 +81,8 @@ class Settings(BaseSettings):
     # ===================================================================
     # GENERACIÓN DE RESPUESTAS
     # ===================================================================
-    max_tokens: int = Field(default=160, alias="MAX_TOKENS")
+    max_tokens: int = Field(default=1024, alias="MAX_TOKENS")
+    reasoning_max_tokens: int = Field(default=1024, alias="REASONING_MAX_TOKENS")
     request_timeout: float = Field(default=60.0, alias="REQUEST_TIMEOUT")
 
     # ===================================================================
@@ -124,15 +127,30 @@ class Settings(BaseSettings):
     # Vacío = documento completo.
     marker_page_range: str = Field(default="", alias="MARKER_PAGE_RANGE")
 
-    # Dispositivo torch opcional para Marker: cpu, cuda, mps. Si se informa, el
-    # loader fija TORCH_DEVICE antes de importar Marker.
-    marker_torch_device: str = Field(default="", alias="MARKER_TORCH_DEVICE")
+    # El proyecto se despliega con GPU NVIDIA. Marker se fuerza a CUDA y el
+    # loader valida que PyTorch pueda verla antes de cargar los modelos.
+    marker_torch_device: Literal["cuda"] = Field(
+        default="cuda",
+        alias="MARKER_TORCH_DEVICE",
+    )
 
 
     model_config = SettingsConfigDict(
         populate_by_name=True,
         extra="ignore",
     )
+
+    @field_validator("llama_cpp_chat_base_url", "llama_cpp_embedding_base_url")
+    @classmethod
+    def reject_server_bind_addresses(cls, value: str) -> str:
+        """Impide usar una direccion de escucha como destino HTTP cliente."""
+        hostname = urlparse(value).hostname
+        if hostname in {"0.0.0.0", "::"}:
+            raise ValueError(
+                "0.0.0.0/:: solo sirve para que un servidor escuche; "
+                "usa 127.0.0.1, localhost o la IP real del servidor"
+            )
+        return value.rstrip("/")
 
     @property
     def data_path(self) -> Path:

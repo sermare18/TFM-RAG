@@ -14,6 +14,16 @@ from rag_cliente.config import Settings
 
 
 class LlamaCppClient:
+    @staticmethod
+    def _thinking_extra_body(enable_reasoning: bool) -> dict[str, Any]:
+        """Activa o desactiva el razonamiento de modelos Qwen híbridos."""
+        return {"chat_template_kwargs": {"enable_thinking": enable_reasoning}}
+
+    def _generation_max_tokens(self, enable_reasoning: bool) -> int:
+        if enable_reasoning:
+            return self.settings.reasoning_max_tokens
+        return self.settings.max_tokens
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
@@ -71,8 +81,9 @@ class LlamaCppClient:
             response = self.chat_client.chat.completions.create(
                 model=self.settings.default_endpoint_model,
                 temperature=0.0,
-                max_tokens=min(self.settings.max_tokens, 2048),
+                max_tokens=min(self.settings.max_tokens, 256),
                 messages=self._build_rewrite_messages(question, normalized_history),
+                extra_body=self._thinking_extra_body(False),
             )
         except Exception:
             return question
@@ -87,13 +98,15 @@ class LlamaCppClient:
         question: str,
         context_blocks: list[str],
         messages: list[dict[str, str]] | None = None,
+        enable_reasoning: bool = False,
     ) -> dict[str, str]:
         """Solicita una respuesta completa al modelo de chat."""
         response = self.chat_client.chat.completions.create(
             model=self.settings.default_endpoint_model,
             temperature=0.2,
-            max_tokens=self.settings.max_tokens,
+            max_tokens=self._generation_max_tokens(enable_reasoning),
             messages=self._build_messages(question, context_blocks, messages=messages),
+            extra_body=self._thinking_extra_body(enable_reasoning),
         )
         message = response.choices[0].message
         content = getattr(message, "content", None)
@@ -101,6 +114,18 @@ class LlamaCppClient:
 
         reasoning_content = getattr(message, "reasoning_content", None)
         reasoning = reasoning_content if isinstance(reasoning_content, str) else ""
+
+        # Un modelo con thinking puede agotar el limite antes de producir la
+        # respuesta final. Conserva su razonamiento y garantiza una respuesta
+        # mediante una segunda llamada breve sin thinking.
+        if enable_reasoning and not answer.strip():
+            fallback = self.generate_answer(
+                question,
+                context_blocks,
+                messages=messages,
+                enable_reasoning=False,
+            )
+            answer = fallback["answer"]
 
         return {
             "answer": answer,
@@ -112,16 +137,19 @@ class LlamaCppClient:
         question: str,
         context_blocks: list[str],
         messages: list[dict[str, str]] | None = None,
+        enable_reasoning: bool = False,
     ):
         """Solicita una respuesta en streaming y va emitiendo tokens/texto."""
         stream = self.chat_client.chat.completions.create(
             model=self.settings.default_endpoint_model,
             temperature=0.2,
-            max_tokens=self.settings.max_tokens,
+            max_tokens=self._generation_max_tokens(enable_reasoning),
             stream=True,
             messages=self._build_messages(question, context_blocks, messages=messages),
+            extra_body=self._thinking_extra_body(enable_reasoning),
         )
 
+        emitted_answer = False
         for chunk in stream:
             if not chunk.choices:
                 continue
@@ -132,6 +160,7 @@ class LlamaCppClient:
             if delta is not None:
                 content = getattr(delta, "content", None)
                 if isinstance(content, str) and content:
+                    emitted_answer = True
                     yield {"type": "answer", "delta": content}
                     continue
 
@@ -142,7 +171,19 @@ class LlamaCppClient:
 
             text = getattr(choice, "text", None)
             if isinstance(text, str) and text:
+                emitted_answer = True
                 yield {"type": "answer", "delta": text}
+
+        # Qwen3.5 puede consumir todo su presupuesto sin cerrar el bloque de
+        # thinking. En ese caso completa el mismo flujo con una fase final sin
+        # thinking, que también se entrega token a token.
+        if enable_reasoning and not emitted_answer:
+            yield from self.stream_answer(
+                question,
+                context_blocks,
+                messages=messages,
+                enable_reasoning=False,
+            )
 
     def select_used_source_ids(
         self,
@@ -170,13 +211,14 @@ class LlamaCppClient:
             response = self.chat_client.chat.completions.create(
                 model=self.settings.default_endpoint_model,
                 temperature=0.0,
-                max_tokens=4096,
+                max_tokens=min(self.settings.max_tokens, 256),
                 messages=self._build_source_attribution_messages(
                     question=question,
                     answer=normalized_answer,
                     source_options=source_options,
                     messages=messages,
                 ),
+                extra_body=self._thinking_extra_body(False),
             )
         except Exception:
             return []

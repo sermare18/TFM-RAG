@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument(
         "--show-reasoning",
         action="store_true",
-        help="Show model reasoning_content when the backend returns it. Hidden by default.",
+        help="Enable model thinking for this request and show its reasoning.",
     )
 
     return parser
@@ -76,42 +76,69 @@ def main() -> None:
 
     if args.command == "ask":
         if args.stream:
-            result = pipeline.stream_answer(args.question, top_k=args.top_k, tag=args.tag)
-            print("\nAnswer:\n")
+            result = pipeline.stream_answer(
+                args.question,
+                top_k=args.top_k,
+                tag=args.tag,
+                enable_reasoning=args.show_reasoning,
+            )
             received_answer = False
+            answer_parts: list[str] = []
             reasoning_parts: list[str] = []
+            answer_heading_printed = False
+            reasoning_heading_printed = False
 
             for event in result["answer_stream"]:
                 if event["type"] == "answer":
                     received_answer = True
+                    answer_parts.append(event["delta"])
+                    if not answer_heading_printed:
+                        print("\nAnswer:\n")
+                        answer_heading_printed = True
                     print(event["delta"], end="", flush=True)
                     continue
 
                 if event["type"] == "reasoning" and args.show_reasoning:
                     reasoning_parts.append(event["delta"])
+                    if not reasoning_heading_printed:
+                        print("\nReasoning:\n")
+                        reasoning_heading_printed = True
+                    print(event["delta"], end="", flush=True)
 
             if not received_answer:
-                fallback_response = result["fallback_response"]()
-                if fallback_response["answer"]:
-                    print(fallback_response["answer"], end="")
-                else:
+                for event in result["fallback_stream"]():
+                    if event["type"] != "answer":
+                        continue
+                    received_answer = True
+                    answer_parts.append(event["delta"])
+                    if not answer_heading_printed:
+                        print("\n\nAnswer (fallback sin thinking):\n")
+                        answer_heading_printed = True
+                    print(event["delta"], end="", flush=True)
+
+                if not received_answer:
+                    if not answer_heading_printed:
+                        print("\nAnswer:\n")
                     print("[No text returned by the model]")
-                if args.show_reasoning and fallback_response["reasoning"]:
-                    reasoning_parts.append(fallback_response["reasoning"])
 
             print("\n")
-            if args.show_reasoning and reasoning_parts:
-                print("\nReasoning:\n")
-                print("".join(reasoning_parts))
+
+            citations = result["resolve_citations"]("".join(answer_parts))
         else:
-            result = pipeline.ask(args.question, top_k=args.top_k, tag=args.tag)
+            result = pipeline.ask(
+                args.question,
+                top_k=args.top_k,
+                tag=args.tag,
+                enable_reasoning=args.show_reasoning,
+            )
             print("\nAnswer:\n")
             print(result["answer"] or "[No text returned by the model]")
             if args.show_reasoning and result["reasoning"]:
                 print("\nReasoning:\n")
                 print(result["reasoning"])
+            citations = result["citations"]
 
-        _print_sources(result["citations"])
+        _print_sources(citations)
         return
 
     parser.error(f"Unsupported command: {args.command}")

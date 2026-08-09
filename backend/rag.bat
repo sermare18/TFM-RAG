@@ -1,0 +1,73 @@
+@echo off
+setlocal
+
+set "ENV_NAME=rag-cliente"
+set "PROJECT_ROOT=%~dp0"
+set "COMMAND=%~1"
+set "FORWARD_ARGS=%*"
+call set "FORWARD_ARGS=%%FORWARD_ARGS:*%COMMAND%=%%"
+
+if "%COMMAND%"=="" goto :help
+where conda >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: Conda no esta disponible en PATH.
+    exit /b 1
+)
+
+cd /d "%PROJECT_ROOT%"
+
+if /I "%COMMAND%"=="api" goto :api
+if /I "%COMMAND%"=="index" goto :index
+if /I "%COMMAND%"=="ask" goto :ask
+if /I "%COMMAND%"=="viewer" goto :viewer
+if /I "%COMMAND%"=="test" goto :test
+if /I "%COMMAND%"=="gpu" goto :gpu
+goto :help
+
+:api
+set "PORT=%~2"
+if "%PORT%"=="" set "PORT=8000"
+echo API: http://localhost:%PORT%/docs
+conda run --no-capture-output -n "%ENV_NAME%" python -m uvicorn rag_cliente.api:app --host 0.0.0.0 --port "%PORT%"
+exit /b %ERRORLEVEL%
+
+:index
+if "%~2"=="" goto :index_default
+set "DOC_DIR=%~2"
+conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli index --doc-dir "%DOC_DIR%" %3 %4 %5 %6 %7 %8 %9
+exit /b %ERRORLEVEL%
+
+:index_default
+conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli index --doc-dir "data\pdfs"
+exit /b %ERRORLEVEL%
+
+:ask
+if "%~2"=="" (
+    echo Uso: rag.bat ask "pregunta" [--top-k N] [--tag TAG] [--stream] [--show-reasoning]
+    exit /b 1
+)
+conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli ask %FORWARD_ARGS%
+exit /b %ERRORLEVEL%
+
+:viewer
+conda run --no-capture-output -n "%ENV_NAME%" python -m streamlit run streamlit_lancedb_viewer.py
+exit /b %ERRORLEVEL%
+
+:test
+conda run --no-capture-output -n "%ENV_NAME%" python -m unittest discover -s tests -v
+exit /b %ERRORLEVEL%
+
+:gpu
+conda run --no-capture-output -n "%ENV_NAME%" python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA disponible:', torch.cuda.is_available()); print('CUDA runtime:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NINGUNA')"
+exit /b %ERRORLEVEL%
+
+:help
+echo Uso: rag.bat ^<comando^> [argumento]
+echo.
+echo   api [puerto]       Arranca FastAPI. Puerto por defecto: 8000
+echo   index [carpeta]    Indexa documentos; admite --tag despues de la carpeta
+echo   ask [opciones]     Consulta el RAG; admite todas las opciones del CLI
+echo   viewer             Abre el visor de LanceDB
+echo   test               Ejecuta los tests
+echo   gpu                Comprueba PyTorch y CUDA
+exit /b 0
