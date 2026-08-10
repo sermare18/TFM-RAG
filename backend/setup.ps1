@@ -30,11 +30,12 @@ else {
     Write-Host "Actualizando el entorno existente '$EnvName'..."
 }
 
-Write-Host "Instalando PyTorch 2.12.1 con CUDA 13.0..."
+Write-Host "Instalando PyTorch 2.12.1 y torchvision 0.27.1 con CUDA 13.0..."
 Invoke-Checked { conda run -n $EnvName python -m pip install --upgrade pip }
 Invoke-Checked {
     conda run -n $EnvName python -m pip install --upgrade `
         "torch==2.12.1" `
+        "torchvision==0.27.1" `
         --index-url $TorchIndexUrl
 }
 

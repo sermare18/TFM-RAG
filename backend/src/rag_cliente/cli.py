@@ -19,12 +19,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local RAG CLI for document indexing and Q&A.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    index_parser = subparsers.add_parser("index", help="Index PDF, DOCX, TXT and image files from a directory.")
+    index_parser = subparsers.add_parser("index", help="Index documents supported by Marker 2 from a directory.")
     index_parser.add_argument(
         "--doc-dir",
         type=Path,
         required=True,
-        help="Directory containing PDF, DOCX, TXT or image files.",
+        help="Directory containing PDF, Office, EPUB, HTML, TXT or image files.",
     )
     index_parser.add_argument("--tag", type=str, default=None, help="Metadata tag to assign to indexed chunks.")
 

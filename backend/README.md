@@ -1,8 +1,9 @@
 # RAG Cliente
 
-RAG local para indexar PDF, DOCX, TXT e imágenes en LanceDB y consultarlos
-mediante CLI o una API compatible con aplicaciones web. Los PDF e imágenes se
-procesan con Marker; PyTorch y Marker están configurados para una GPU NVIDIA.
+RAG local para indexar PDF, DOCX, PPTX, XLSX, EPUB, HTML, TXT e imágenes en
+LanceDB y consultarlos mediante CLI o una API compatible con aplicaciones web.
+Los documentos estructurados se procesan con Marker 2; PyTorch y Marker están
+configurados para una GPU NVIDIA.
 
 ## Requisitos
 
@@ -51,15 +52,49 @@ VECTOR_WEIGHT=0.65
 BM25_WEIGHT=0.35
 ```
 
-Marker se controla con `MARKER_ENABLED`, `MARKER_FORCE_OCR`,
-`MARKER_STRIP_EXISTING_OCR`, `MARKER_USE_LLM`,
-`MARKER_DISABLE_IMAGE_EXTRACTION` y `MARKER_PAGE_RANGE`.
+Marker 2 se controla con `MARKER_ENABLED`, `MARKER_MODE`, `MARKER_OCR_MODE`,
+`MARKER_STRIP_EXISTING_OCR`,
+`MARKER_USE_LLM`, `MARKER_DISABLE_IMAGE_EXTRACTION` y `MARKER_PAGE_RANGE`.
+
+La configuración recomendada para GPU es:
+
+```env
+MARKER_MODE=balanced
+MARKER_OCR_MODE=adaptive
+MARKER_INFERENCE_BACKEND=auto
+MARKER_LLAMA_CPP_BINARY=
+MARKER_FULL_PAGE_OCR_COMPLEX_LAYOUT=true
+MARKER_TABLE_MIN_RECON_SCORE=0.75
+```
+
+En este modo Marker 2 conserva la capa digital cuando es fiable y activa el
+procesamiento visual de forma selectiva para páginas escaneadas, bloques
+defectuosos y tablas de baja confianza. Los valores `force` y `disabled` quedan
+como overrides de diagnóstico; el funcionamiento normal usa `adaptive`.
+
+El modo `balanced` necesita un servidor VLM de Surya. En Linux/CUDA, `auto`
+puede arrancar vLLM mediante Docker. En Windows se puede evitar Docker usando:
+
+```env
+MARKER_INFERENCE_BACKEND=llamacpp
+MARKER_LLAMA_CPP_BINARY=D:\ruta\a\llama-server.exe
+```
+
+La primera ejecución descarga el modelo GGUF de Surya 2 a la caché del usuario.
+Si se selecciona `vllm`, Docker Desktop debe estar iniciado antes de indexar.
+
+`MARKER_FULL_PAGE_OCR_COMPLEX_LAYOUT=true` conserva `pdftext` en páginas
+sencillas y promueve a OCR completo solo las páginas donde el layout detecta
+`Table`, `Form` o `ComplexRegion`. El OCR recibe así el contexto global que
+necesita para ordenar columnas paralelas. `MARKER_TABLE_MIN_RECON_SCORE=0.75`
+queda como fallback secundario del procesador de tablas de Marker 2.
 
 ## Uso
 
-Coloca los documentos en `data/pdfs`. Se admiten PDF, DOCX, TXT, PNG, JPG,
-JPEG, BMP, TIF, TIFF y WEBP. Las subcarpetas se usan como etiquetas; por
-ejemplo, `data/pdfs/confidencial/contrato.pdf` recibe el tag `confidencial`.
+Coloca los documentos en `data/pdfs`. Se admiten PDF, DOCX, PPTX, XLSX, EPUB,
+HTML, TXT, PNG, JPG, JPEG, BMP, TIF, TIFF y WEBP. Las subcarpetas se usan como
+etiquetas; por ejemplo, `data/pdfs/confidencial/contrato.pdf` recibe el tag
+`confidencial`.
 
 ```powershell
 # Comprobar la GPU

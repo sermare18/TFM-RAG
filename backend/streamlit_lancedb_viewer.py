@@ -21,6 +21,7 @@ def apply_filters(
     source_type_filter: list[str],
     tag_filter: list[str],
     text_query: str,
+    ocr_filter: str = "Todos",
 ) -> list[dict]:
     """
     Esta función recibe:
@@ -45,6 +46,12 @@ def apply_filters(
 
     if tag_filter:
         filtered = [row for row in filtered if row.get("tag") in tag_filter]
+
+    # Distingo False de un campo ausente para no presentar un índice antiguo como si hubiera evitado el OCR.
+    if ocr_filter == "Con OCR":
+        filtered = [row for row in filtered if row.get("ocr_used") == True]
+    elif ocr_filter == "Sin OCR":
+        filtered = [row for row in filtered if row.get("ocr_used") == False]
 
     # Comprueba si el usuario escribió algo útil
     # Elimina esacios al principio y al final
@@ -77,10 +84,13 @@ def build_table_rows(rows: list[dict], show_full_text: bool) -> list[dict]:
 
     # Recorremos cada chunk
     for row in rows:
+        ocr_used = row.get("ocr_used")
+        ocr_label = "Sí" if ocr_used is True else "No" if ocr_used is False else "No registrado"
         table_rows.append(
             {
                 "source": row.get("source"),
                 "source_type": row.get("source_type"),
+                "ocr_used": ocr_label,
                 "tag": row.get("tag"),
                 "page_start": row.get("page_start"),
                 "page_end": row.get("page_end"),
@@ -151,6 +161,8 @@ def main() -> None:
     # Permite seleccionar varios source_type a la vez
     selected_source_types = st.sidebar.multiselect("Filtrar por source_type", source_type_options)
     selected_tags = st.sidebar.multiselect("Filtrar por tag", tag_options)
+    # Ofrezco un único selector para poder aislar rápidamente los chunks procesados con OCR.
+    selected_ocr = st.sidebar.selectbox("Filtrar por OCR", ["Todos", "Con OCR", "Sin OCR"])
 
     # Aplica los filtros
     filtered_rows = apply_filters(
@@ -159,6 +171,7 @@ def main() -> None:
         source_type_filter=selected_source_types,
         tag_filter=selected_tags,
         text_query=text_query,
+        ocr_filter=selected_ocr,
     )
 
     # Número total de chunks tras filtrar
@@ -196,7 +209,8 @@ def main() -> None:
     # Muestra un dataframe visual en Streamlit
     st.dataframe(
         build_table_rows(page_rows, show_full_text=show_full_text),
-        use_container_width=True,
+        # Adapto la tabla al ancho disponible con la API vigente de Streamlit.
+        width="stretch",
         hide_index=True,
     )
 
@@ -218,6 +232,9 @@ def main() -> None:
         with st.expander(title):
             st.write(f"**source_path:** {row.get('source_path')}")
             st.write(f"**source_type:** {row.get('source_type')}")
+            ocr_used = row.get("ocr_used")
+            ocr_label = "Sí" if ocr_used is True else "No" if ocr_used is False else "No registrado"
+            st.write(f"**ocr_used:** {ocr_label}")
             st.write(f"**tag:** {row.get('tag') or ''}")
             st.code(row.get("text", ""), language=None)
 

@@ -22,10 +22,11 @@ from pydantic import BaseModel, Field
 
 from rag_cliente.config import get_settings
 from rag_cliente.pipeline import RagPipeline
-from rag_cliente.pdf_loader import IMAGE_SUFFIXES
+from rag_cliente.pdf_loader import SUPPORTED_DOCUMENT_SUFFIXES
 
-
-DOCUMENT_SUFFIXES = {".pdf", ".docx", ".txt", *IMAGE_SUFFIXES}
+# Reutilizo una única lista para que la API y el indexador acepten exactamente
+# los mismos formatos cuando yo amplíe los proveedores de Marker.
+DOCUMENT_SUFFIXES = SUPPORTED_DOCUMENT_SUFFIXES
 
 
 class ChatMessage(BaseModel):
@@ -38,7 +39,7 @@ class ChatMessage(BaseModel):
 class IndexRequest(BaseModel):
     """Payload para indexar documentos desde un directorio local."""
 
-    doc_dir: str = Field(..., description="Directory containing PDF, DOCX, and TXT files.")
+    doc_dir: str = Field(..., description="Directory containing supported document files.")
     tag: str | None = Field(default=None, description="Optional metadata tag assigned to indexed chunks.")
 
 

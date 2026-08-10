@@ -4,24 +4,22 @@ Este módulo convierte documentos locales en una lista homogénea de
 `PageDocument`, que es la estructura que consume el chunker del proyecto.
 
 Formatos soportados:
-- PDF (`.pdf`): parser principal con Marker. Si se desactiva Marker, queda un
-  fallback nativo con PyMuPDF para PDFs digitales.
-- Word (`.docx`): párrafos y tablas con python-docx.
+- Con Marker 2 full: PDF, DOCX, PPTX, XLSX, EPUB, HTML e imágenes.
 - Texto plano (`.txt`): lectura UTF-8.
-- Imágenes (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.tif`, `.tiff`, `.webp`): parser
-  con Marker cuando está habilitado.
+- Si desactivo Marker, conservo fallbacks nativos para PDF digital, DOCX y TXT.
 
-Decisión principal para PDFs:
-Marker se usa como parser/OCR principal y se configura para devolver Markdown
-paginado. Markdown conserva encabezados, listas, tablas y fórmulas en una forma
-muy útil para embeddings y RAG sin obligar a reescribir el chunker actual. El
-paginado permite seguir generando citas por página/unidad lógica.
+Decisión principal:
+Uso Marker 2 en modo adaptativo para conservar texto digital fiable y activar
+OCR/VLM solo en páginas, bloques o tablas que lo necesiten. Pido Markdown
+paginado porque conserva estructura útil para RAG y mantiene las citas.
 """
 from __future__ import annotations
 
 import os
 import re
+import subprocess
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,6 +29,16 @@ from docx import Document
 from rag_cliente.config import Settings
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+MARKER_DOCUMENT_SUFFIXES = {
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".epub",
+    ".html",
+    *IMAGE_SUFFIXES,
+}
+SUPPORTED_DOCUMENT_SUFFIXES = {".txt", *MARKER_DOCUMENT_SUFFIXES}
 ProgressCallback = Callable[[str], None]
 _MARKER_PAGE_SEPARATOR_RE = re.compile(
     r"(?:^|\n+)(?:\{)?(\d+)(?:\})?-{20,}[ \t]*(?:\n+|$)"
@@ -100,11 +108,11 @@ def _as_1_based_page_number(raw_page_id: Any) -> int | None:
 
 
 def _collect_marker_page_extraction_details(page: Any, document: Any) -> dict[str, Any]:
-    """Recoge señales internas de Marker sobre OCR/visión en una página.
+    """Recojo señales internas de Marker 2 sobre OCR/visión por página.
 
-    `page_stats.text_extraction_method` solo describe el método dominante de la
-    página. Para no perder OCR parcial, también inspeccionamos bloques internos
-    renderizados por Marker y `ocr_errors_detected`.
+    No me basta con `page.text_extraction_method`: en modo fast Marker puede
+    reparar un bloque aislado, y en ambos modos una tabla digital de baja
+    confianza puede usar el fallback visual sin convertir toda la página.
     """
     methods: set[str] = set()
 
@@ -124,22 +132,29 @@ def _collect_marker_page_extraction_details(page: Any, document: Any) -> dict[st
         add_method(getattr(block, "text_extraction_method", None))
 
     ocr_errors_detected = bool(getattr(page, "ocr_errors_detected", False))
-    ocr_used = ocr_errors_detected or any(method != "pdftext" for method in methods)
+    visual_methods = sorted(method for method in methods if method != "pdftext")
+    ocr_used = ocr_errors_detected or bool(visual_methods)
+
+    reasons: list[str] = []
+    if ocr_errors_detected:
+        reasons.append("embedded_text_rejected")
+    if visual_methods:
+        reasons.append("visual_block_or_table_fallback")
 
     return {
         "text_extraction_methods": sorted(methods),
         "ocr_errors_detected": ocr_errors_detected,
         "ocr_used": ocr_used,
+        "ocr_reasons": reasons,
     }
 
 
 class MarkerMarkdownRendererWithOcrMetadata:
-    """Renderer Markdown de Marker enriquecido con metadatos OCR por página.
+    """Enriquezco el renderer Markdown de Marker con metadatos OCR por página.
 
-    Marker ya genera `page_stats`, pero esa salida puede quedarse corta para
-    saber si hubo OCR parcial. Este wrapper delega el Markdown real en el
-    renderer oficial y añade campos derivados inspeccionando el documento
-    interno justo antes de devolver el resultado.
+    Delego el Markdown al renderer oficial para no duplicar su lógica y, antes
+    de devolverlo, registro también reparaciones visuales parciales y tablas que
+    hayan caído al OCR adaptativo de Marker 2.
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
@@ -206,18 +221,24 @@ def _load_native_pdf_pages(pdf_path: Path) -> list[PageDocument]:
 
 
 def _build_marker_config(settings: Settings) -> dict[str, Any]:
-    """Construye la configuración mínima para Marker.
+    """Construyo la configuración adaptativa de Marker 2.
 
-    Se pide Markdown paginado porque conserva estructura útil para RAG y permite
-    reconstruir `PageDocument` por página sin cambiar el resto del pipeline.
+    Uso `balanced` por defecto en CUDA para que Marker decida automáticamente
+    entre pdftext, OCR completo y fallback visual de tablas. Mantengo
+    `force_ocr` como override manual, pero no lo necesito en el flujo normal.
     """
+    ocr_mode = settings.marker_ocr_mode
     config: dict[str, Any] = {
         "output_format": "markdown",
         "paginate_output": True,
         "disable_image_extraction": settings.marker_disable_image_extraction,
+        "mode": settings.marker_mode,
+        "disable_ocr": ocr_mode == "disabled",
+        "min_recon_score": settings.marker_table_min_recon_score,
+        "force_ocr_complex_layout": settings.marker_full_page_ocr_complex_layout,
     }
 
-    if settings.marker_force_ocr:
+    if ocr_mode == "force":
         config["force_ocr"] = True
 
     if settings.marker_strip_existing_ocr:
@@ -232,17 +253,98 @@ def _build_marker_config(settings: Settings) -> dict[str, Any]:
     return config
 
 
+def _require_marker_2() -> str:
+    """Compruebo que el entorno ejecuta Marker 2 antes de crear sus modelos."""
+    try:
+        installed_version = version("marker-pdf")
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            "Marker no está instalado. Ejecuta setup.ps1 para instalar marker-pdf 2.x."
+        ) from exc
+
+    try:
+        major_version = int(installed_version.split(".", 1)[0])
+    except ValueError as exc:
+        raise RuntimeError(f"No pude interpretar la versión de Marker: {installed_version}") from exc
+
+    if major_version != 2:
+        raise RuntimeError(
+            f"Este proyecto requiere marker-pdf 2.x y encontré {installed_version}. "
+            "Ejecuta setup.ps1 para sincronizar el entorno."
+        )
+    return installed_version
+
+
+def _install_surya_windows_cleanup_workaround() -> None:
+    """Evito que el cierre de llama.cpp de Surya interrumpa mi propio proceso en Windows.
+
+    Surya 0.22.1 registra un callback `atexit` que usa `os.kill()` y después
+    sondea el PID. En Windows ese flujo puede generar un `KeyboardInterrupt`
+    en el proceso que ejecuta el indexado. Sustituyo solo esa función interna
+    por `taskkill /F`, dirigido al PID exacto que Surya acaba de crear.
+    """
+    if os.name != "nt":
+        return
+
+    from surya.inference.backends import spawn as surya_spawn
+
+    def stop_process_without_console_signal(pid: int, name: str) -> None:
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode == 0:
+                surya_spawn.logger.info(f"Stopped {name} (pid {pid})")
+                return
+
+            # Considero inocuo que el servidor ya haya terminado antes del callback.
+            output = (completed.stderr or completed.stdout or b"").decode(
+                errors="replace"
+            ).strip()
+            if output:
+                surya_spawn.logger.debug(
+                    f"No tuve que detener {name} (pid {pid}): {output}"
+                )
+        except Exception as exc:
+            # No dejo que un fallo de limpieza oculte un indexado ya completado.
+            surya_spawn.logger.warning(
+                f"No pude cerrar {name} (pid {pid}) durante la limpieza: {exc}"
+            )
+
+    surya_spawn._stop_process = stop_process_without_console_signal
+
+
 def create_marker_converter(settings: Settings) -> Any:
-    """Inicializa Marker una sola vez para reutilizar modelos entre archivos.
+    """Inicializo Marker 2 una vez y reutilizo sus modelos entre documentos.
 
     Raises:
         RuntimeError: Si `marker-pdf` no está instalado o no puede inicializarse.
     """
+    _require_marker_2()
     marker_device = settings.marker_torch_device.strip().lower()
     if marker_device:
-        # Marker documenta TORCH_DEVICE como mecanismo para forzar cpu/cuda/mps.
-        # Se fija antes de importar Marker para que torch lo vea al inicializar.
+        # Fijo TORCH_DEVICE antes de importar Marker para que yo no inicialice
+        # accidentalmente los modelos grandes en CPU.
         os.environ["TORCH_DEVICE"] = marker_device
+
+    inference_backend = settings.marker_inference_backend.strip().lower()
+    if inference_backend != "auto":
+        # Propago el backend antes de importar Surya para que yo controle si el
+        # servidor visual se ejecuta con vLLM/Docker o con llama.cpp local.
+        os.environ["SURYA_INFERENCE_BACKEND"] = inference_backend
+
+    llama_cpp_binary = settings.marker_llama_cpp_binary.strip()
+    if llama_cpp_binary:
+        resolved_binary = Path(llama_cpp_binary).expanduser().resolve()
+        if not resolved_binary.is_file():
+            raise RuntimeError(
+                f"MARKER_LLAMA_CPP_BINARY no existe o no es un archivo: {resolved_binary}"
+            )
+        os.environ["LLAMA_CPP_BINARY"] = str(resolved_binary)
 
     if marker_device == "cuda":
         try:
@@ -259,20 +361,78 @@ def create_marker_converter(settings: Settings) -> Any:
             )
 
     try:
+        from marker.builders.document import DocumentBuilder
+        from marker.builders.layout import LayoutBuilder
+        from marker.builders.line import LineBuilder
+        from marker.builders.ocr import OcrBuilder
+        from marker.builders.structure import StructureBuilder
         from marker.config.parser import ConfigParser
         from marker.converters.pdf import PdfConverter
         from marker.models import create_model_dict
+        from marker.providers.registry import provider_from_filepath
+        from marker.schema import BlockTypes
     except ImportError as exc:
         raise RuntimeError(
-            "Marker no está instalado. Instala la dependencia con: "
-            "python -m pip install marker-pdf"
+            "Marker 2 no está instalado con todos los proveedores. "
+            "Ejecuta setup.ps1 para instalar marker-pdf[full]."
         ) from exc
 
+    # Instalo el ajuste antes de que Surya registre su callback de salida.
+    _install_surya_windows_cleanup_workaround()
+
     try:
+        class LayoutAwareLineBuilder(LineBuilder):
+            """Promuevo a OCR completo las páginas que yo detecto como complejas."""
+
+            force_ocr_complex_layout: bool = True
+            complex_layout_types = (
+                BlockTypes.Table,
+                BlockTypes.Form,
+                BlockTypes.ComplexRegion,
+            )
+
+            def get_all_lines(self, document: Any, provider: Any) -> dict[int, list[Any]]:
+                page_lines = super().get_all_lines(document, provider)
+                if self.disable_ocr or not self.force_ocr_complex_layout:
+                    return page_lines
+
+                for page in document.pages:
+                    # Decido después del layout y antes del OCR: si veo una
+                    # estructura compleja, descarto solo las líneas digitales de
+                    # esa página para que Surya la reconstruya con contexto global.
+                    blocks = page.structure_blocks(document)
+                    if any(block.block_type in self.complex_layout_types for block in blocks):
+                        page.text_extraction_method = "surya"
+                        page_lines[page.page_id] = []
+                return page_lines
+
+        class AdaptivePdfConverter(PdfConverter):
+            """Uso mi selector de OCR por layout sin alterar los procesadores de Marker."""
+
+            def build_document(self, filepath: str) -> Any:
+                provider_cls = provider_from_filepath(filepath)
+                layout_builder = self.resolve_dependencies(LayoutBuilder)
+                line_builder = self.resolve_dependencies(LayoutAwareLineBuilder)
+                ocr_builder = self.resolve_dependencies(OcrBuilder)
+                provider = provider_cls(filepath, self.config)
+                document = DocumentBuilder(self.config)(
+                    provider,
+                    layout_builder,
+                    line_builder,
+                    ocr_builder,
+                )
+                structure_builder = self.resolve_dependencies(StructureBuilder)
+                structure_builder(document)
+                for processor in self.processor_list:
+                    processor(document)
+                return document
+
         config_parser = ConfigParser(_build_marker_config(settings))
-        return PdfConverter(
+        return AdaptivePdfConverter(
             config=config_parser.generate_config_dict(),
-            artifact_dict=create_model_dict(),
+            artifact_dict=create_model_dict(
+                inference_backend=None if inference_backend == "auto" else inference_backend
+            ),
             processor_list=config_parser.get_processors(),
             renderer="rag_cliente.pdf_loader.MarkerMarkdownRendererWithOcrMetadata",
             llm_service=config_parser.get_llm_service(),
@@ -346,10 +506,11 @@ def _extract_marker_ocr_usage_by_page(metadata: dict[str, Any]) -> dict[int, boo
 
 
 def _split_marker_markdown_by_page(markdown: str) -> list[tuple[int, str]]:
-    """Divide el Markdown paginado de Marker en pares (page_number, text).
+    """Divido el Markdown de Marker 2 en pares con página humana 1-based.
 
-    Marker pagina con una línea de número de página y un separador de guiones.
-    Si la salida no incluye separadores, se devuelve una única unidad lógica.
+    Marker 2 escribe siempre el `page_id` interno 0-based en el separador. Sumo
+    uno incluso cuando yo proceso un rango que empieza después de la página 0;
+    así evito que las citas queden desplazadas al usar `MARKER_PAGE_RANGE`.
     """
     normalized_markdown = markdown.strip()
     if not normalized_markdown:
@@ -360,12 +521,11 @@ def _split_marker_markdown_by_page(markdown: str) -> list[tuple[int, str]]:
         return [(1, _normalize_text(normalized_markdown))]
 
     raw_page_numbers = [int(match.group(1)) for match in matches]
-    page_offset = 1 if min(raw_page_numbers) == 0 else 0
     pages: list[tuple[int, str]] = []
 
     preamble = normalized_markdown[: matches[0].start()].strip()
     if preamble:
-        first_page = raw_page_numbers[0] + page_offset
+        first_page = raw_page_numbers[0] + 1
         pages.append((max(first_page, 1), _normalize_text(preamble)))
 
     for index, match in enumerate(matches):
@@ -374,7 +534,7 @@ def _split_marker_markdown_by_page(markdown: str) -> list[tuple[int, str]]:
         text = _normalize_text(normalized_markdown[start:end])
         if not text:
             continue
-        page_number = int(match.group(1)) + page_offset
+        page_number = int(match.group(1)) + 1
         pages.append((max(page_number, 1), text))
 
     return pages
@@ -386,7 +546,7 @@ def _marker_document_pages(
     marker_converter: Any,
     default_ocr_used: bool = False,
 ) -> list[PageDocument]:
-    """Procesa un PDF o imagen con Marker y lo adapta a PageDocument."""
+    """Adapto cualquier salida paginada de Marker 2 a `PageDocument`."""
     try:
         markdown, metadata = _render_with_marker(path, marker_converter)
     except Exception as exc:
@@ -418,13 +578,34 @@ def _marker_document_pages(
     return pages
 
 
+def load_marker_document_pages(
+    document_path: Path,
+    settings: Settings,
+    marker_converter: Any | None = None,
+) -> list[PageDocument]:
+    """Proceso con Marker 2 cualquier formato admitido por su paquete full.
+
+    Dejo que el modo de Marker decida la estrategia para cada página y bloque.
+    Solo marco OCR por defecto en imágenes puras o cuando yo lo fuerzo de forma
+    explícita; para el resto uso los metadatos reales del renderer enriquecido.
+    """
+    converter = marker_converter or create_marker_converter(settings)
+    suffix = document_path.suffix.lower()
+    return _marker_document_pages(
+        document_path,
+        source_type=suffix.lstrip("."),
+        marker_converter=converter,
+        default_ocr_used=suffix in IMAGE_SUFFIXES or settings.marker_ocr_mode == "force",
+    )
+
+
 def load_pdf_pages(
     pdf_path: Path,
     settings: Settings | None = None,
     ocr_pipeline: Any | None = None,
     marker_converter: Any | None = None,
 ) -> list[PageDocument]:
-    """Carga un PDF usando Marker como parser principal.
+    """Cargo un PDF con Marker 2 o con mi fallback digital si lo desactivo.
 
     `ocr_pipeline` se mantiene por compatibilidad con llamadas antiguas del
     backend; si se recibe, se trata como un converter de Marker ya inicializado.
@@ -432,15 +613,10 @@ def load_pdf_pages(
     if settings is None or not settings.marker_enabled:
         return _load_native_pdf_pages(pdf_path)
 
-    converter = marker_converter or ocr_pipeline
-    if converter is None:
-        converter = create_marker_converter(settings)
-
-    return _marker_document_pages(
+    return load_marker_document_pages(
         pdf_path,
-        source_type="pdf",
-        marker_converter=converter,
-        default_ocr_used=settings.marker_force_ocr,
+        settings=settings,
+        marker_converter=marker_converter or ocr_pipeline,
     )
 
 
@@ -489,7 +665,7 @@ def load_image_pages(
     ocr_pipeline: Any | None = None,
     marker_converter: Any | None = None,
 ) -> list[PageDocument]:
-    """Carga una imagen mediante Marker cuando está habilitado.
+    """Cargo una imagen mediante el OCR adaptativo de Marker 2.
 
     Mantiene compatibilidad funcional con el soporte previo de imágenes sin
     depender de PaddleOCR/PaddleX.
@@ -497,15 +673,10 @@ def load_image_pages(
     if settings is None or not settings.marker_enabled:
         return []
 
-    converter = marker_converter or ocr_pipeline
-    if converter is None:
-        converter = create_marker_converter(settings)
-
-    return _marker_document_pages(
+    return load_marker_document_pages(
         image_path,
-        source_type=image_path.suffix.lower().lstrip("."),
-        marker_converter=converter,
-        default_ocr_used=True,
+        settings=settings,
+        marker_converter=marker_converter or ocr_pipeline,
     )
 
 
@@ -514,10 +685,10 @@ def load_documents_from_directory(
     settings: Settings | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> list[PageDocument]:
-    """Carga todos los documentos soportados de un directorio de forma recursiva.
+    """Cargo recursivamente todos los formatos soportados por Marker 2 full.
 
-    Si un archivo falla, se emite un aviso y se continúa con el resto. No se
-    tragan excepciones silenciosamente: el motivo queda visible en el progreso.
+    Si un archivo falla, continúo con los demás y dejo el motivo visible en el
+    progreso para que yo pueda diagnosticarlo sin perder toda la indexación.
     """
     if not doc_dir.exists():
         raise FileNotFoundError(f"Document directory does not exist: {doc_dir}")
@@ -527,15 +698,12 @@ def load_documents_from_directory(
     supported_paths = [
         path
         for path in paths
-        if path.suffix.lower() in {".pdf", ".docx", ".txt", *IMAGE_SUFFIXES}
+        if path.suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES
     ]
 
     marker_converter: Any | None = None
     if settings is not None and settings.marker_enabled:
-        needs_marker = any(
-            path.suffix.lower() == ".pdf" or path.suffix.lower() in IMAGE_SUFFIXES
-            for path in supported_paths
-        )
+        needs_marker = any(path.suffix.lower() in MARKER_DOCUMENT_SUFFIXES for path in supported_paths)
         if needs_marker:
             _emit(progress_callback, "Inicializando Marker...")
             marker_converter = create_marker_converter(settings)
@@ -554,26 +722,23 @@ def load_documents_from_directory(
         _emit(progress_callback, f"Procesando archivo {file_index}/{total_files}: {display_path}")
 
         try:
-            if suffix == ".pdf":
-                if settings is not None and settings.marker_enabled:
-                    _emit(progress_callback, f"Parseando PDF con Marker: {display_path}")
-                pages = load_pdf_pages(
+            if suffix == ".txt":
+                pages = load_txt_pages(path)
+            elif settings is not None and settings.marker_enabled and suffix in MARKER_DOCUMENT_SUFFIXES:
+                _emit(
+                    progress_callback,
+                    f"Parseando {suffix.lstrip('.').upper()} con Marker 2 "
+                    f"({settings.marker_mode}): {display_path}",
+                )
+                pages = load_marker_document_pages(
                     path,
                     settings=settings,
                     marker_converter=marker_converter,
                 )
+            elif suffix == ".pdf":
+                pages = _load_native_pdf_pages(path)
             elif suffix == ".docx":
                 pages = load_docx_pages(path)
-            elif suffix == ".txt":
-                pages = load_txt_pages(path)
-            elif suffix in IMAGE_SUFFIXES:
-                if settings is not None and settings.marker_enabled:
-                    _emit(progress_callback, f"Parseando imagen con Marker: {display_path}")
-                pages = load_image_pages(
-                    path,
-                    settings=settings,
-                    marker_converter=marker_converter,
-                )
             else:
                 continue
         except Exception as exc:

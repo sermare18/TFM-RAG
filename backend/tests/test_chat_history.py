@@ -48,6 +48,10 @@ class _FakeBM25Okapi:
 
 fake_indexer.PdfChunker = _FakePdfChunker
 fake_pdf_loader.IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+fake_pdf_loader.SUPPORTED_DOCUMENT_SUFFIXES = {
+    ".pdf", ".docx", ".pptx", ".xlsx", ".epub", ".html", ".txt",
+    *fake_pdf_loader.IMAGE_SUFFIXES,
+}
 fake_pdf_loader.load_documents_from_directory = lambda doc_dir: []
 fake_vector_store.LanceDBStore = _FakeLanceDBStore
 fake_rank_bm25.BM25Okapi = _FakeBM25Okapi

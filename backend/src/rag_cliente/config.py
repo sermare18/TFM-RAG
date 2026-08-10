@@ -98,15 +98,51 @@ class Settings(BaseSettings):
     api_cors_allow_origins: list[str] = Field(default=["*"], alias="API_CORS_ALLOW_ORIGINS")
 
     # ===================================================================
-    # MARKER - PARSER/OCR PRINCIPAL PARA PDFS E IMÁGENES
+    # MARKER 2 - PARSER/OCR ADAPTATIVO PARA DOCUMENTOS
     # ===================================================================
-    # Activa Marker para PDFs e imágenes. Si se desactiva, los PDFs digitales
-    # usan fallback nativo PyMuPDF y las imágenes no se indexan.
+    # Activo Marker full para PDF, Office, EPUB, HTML e imágenes. Si lo
+    # desactivo, conservo fallbacks nativos para PDF digital, DOCX y TXT.
     marker_enabled: bool = Field(default=True, alias="MARKER_ENABLED")
 
-    # Fuerza OCR visual incluso si el PDF contiene texto digital. Es útil si el
-    # texto embebido está corrupto o si quieres mejor preservación de tablas/math.
-    marker_force_ocr: bool = Field(default=False, alias="MARKER_FORCE_OCR")
+    # Expreso los tres comportamientos OCR con un solo valor para que yo no
+    # pueda crear combinaciones contradictorias con varios booleanos.
+    marker_ocr_mode: Literal["adaptive", "force", "disabled"] = Field(
+        default="adaptive",
+        alias="MARKER_OCR_MODE",
+    )
+
+    # Uso balanced en CUDA para que yo obtenga layout VLM, OCR adaptativo y
+    # fallback visual automático en tablas de baja confianza.
+    marker_mode: Literal["balanced", "fast"] = Field(
+        default="balanced",
+        alias="MARKER_MODE",
+    )
+
+    # Elijo el servidor VLM que usará Surya. En Windows puedo usar llama.cpp
+    # sin depender de Docker; dejo auto disponible para otros despliegues.
+    marker_inference_backend: Literal["auto", "vllm", "llamacpp"] = Field(
+        default="auto",
+        alias="MARKER_INFERENCE_BACKEND",
+    )
+
+    # Si elijo llama.cpp, indico el ejecutable local para que yo pueda arrancar
+    # el servidor OCR de Surya aunque no esté registrado en PATH.
+    marker_llama_cpp_binary: str = Field(default="", alias="MARKER_LLAMA_CPP_BINARY")
+
+    # Mantengo el umbral oficial de balanced como segunda red de seguridad para
+    # tablas que lleguen al TableProcessor sin promover antes toda su página.
+    marker_table_min_recon_score: float = Field(
+        default=0.75,
+        alias="MARKER_TABLE_MIN_RECON_SCORE",
+        ge=0.0,
+    )
+
+    # Promuevo a OCR completo solo las páginas cuyo layout contenga tablas,
+    # formularios o regiones complejas; así conservo contexto y orden de lectura.
+    marker_full_page_ocr_complex_layout: bool = Field(
+        default=True,
+        alias="MARKER_FULL_PAGE_OCR_COMPLEX_LAYOUT",
+    )
 
     # Elimina texto OCR existente en el PDF antes de re-OCR. Útil para documentos
     # con capa OCR mala o duplicada.

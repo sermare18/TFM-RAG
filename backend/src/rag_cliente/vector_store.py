@@ -19,11 +19,14 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import lancedb
 import pyarrow as pa
 
-from rag_cliente.indexer import ChunkRecord
+if TYPE_CHECKING:
+    # Importo ChunkRecord solo para tipos y evito cargar el stack de chunking en el viewer.
+    from rag_cliente.indexer import ChunkRecord
 
 
 def build_schema(vector_dim: int) -> pa.Schema:
