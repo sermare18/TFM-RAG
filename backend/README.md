@@ -165,6 +165,8 @@ disponible en `http://localhost:8000/docs`.
 `models plan`, `models check` y `doctor` nunca descargan ni arrancan modelos.
 `models download` usa Hugging Face Hub únicamente cuando el usuario ejecuta el
 comando y deja los artefactos bajo `MODELS_DIR`; tampoco arranca `llama-server`.
+El perfil GPU descarga para chat el GGUF Q4_K_M de Qwen3.5 9B publicado por
+`bartowski`, cuantizado a partir de los pesos oficiales de `Qwen/Qwen3.5-9B`.
 
 ## API HTTP
 

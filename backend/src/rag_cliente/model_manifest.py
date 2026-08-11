@@ -96,15 +96,18 @@ MODEL_MANIFEST: tuple[ModelRoleSpec, ...] = (
     ),
     ModelRoleSpec(
         key="chat_gpu",
-        label="Chat GPU Qwen3.5 9B existente",
-        repository=None,
+        label="Chat GPU Qwen3.5 9B",
+        repository="bartowski/Qwen_Qwen3.5-9B-GGUF",
         directory="qwen3.5-9b",
         quantization="Q4_K_M",
         artifacts=(
-            ArtifactSpec("model", ("*Q4_K_M*.gguf",), "aprox. 5-7 GiB"),
+            ArtifactSpec(
+                "model",
+                ("Qwen_Qwen3.5-9B-Q4_K_M.gguf",),
+                "aprox. 5-7 GiB",
+            ),
         ),
         profiles=("gpu",),
-        configurable_only=True,
     ),
 )
 
@@ -308,6 +311,23 @@ def download_models(settings: Settings, profile: ModelProfile) -> list[dict]:
             local_dir=local_dir,
             allow_patterns=allow_patterns,
         )
+        missing_artifacts = []
+        for artifact in role.artifacts:
+            artifact_path = resolve_artifact_path(settings, role, artifact)
+            if not artifact_path.is_file():
+                missing_artifacts.append(str(artifact_path))
+        if missing_artifacts:
+            results.append(
+                {
+                    "role": role.key,
+                    "downloaded": False,
+                    "message": (
+                        "Hugging Face no devolvió los artefactos esperados: "
+                        + ", ".join(missing_artifacts)
+                    ),
+                }
+            )
+            continue
         results.append(
             {
                 "role": role.key,

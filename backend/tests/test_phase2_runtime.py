@@ -20,7 +20,7 @@ from rag_cliente.marker_llm import (
     LLMBudgetExceededError,
     MarkerLLMError,
 )
-from rag_cliente.model_manifest import check_artifact
+from rag_cliente.model_manifest import check_artifact, download_models
 from rag_cliente.model_supervisor import ModelServerSpec, ModelSupervisor
 from rag_cliente.pdf_loader import create_marker_converter
 from rag_cliente.pdf_loader import _build_marker_config
@@ -568,6 +568,70 @@ class ModelCommandTests(unittest.TestCase):
                 cli_main()
 
         download.assert_not_called()
+
+    def test_gpu_download_includes_qwen35_chat_model(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp_dir:
+            settings = Settings(MODELS_DIR=tmp_dir)
+
+            def create_downloaded_files(*, repo_id, local_dir, allow_patterns):
+                del repo_id
+                for pattern in allow_patterns:
+                    filename = pattern.replace("*", "artifact")
+                    (local_dir / filename).write_bytes(b"GGUF")
+
+            snapshot_download = Mock(side_effect=create_downloaded_files)
+
+            with patch("huggingface_hub.snapshot_download", snapshot_download):
+                results = download_models(settings, "gpu")
+
+            chat_dir = (Path(tmp_dir) / "qwen3.5-9b").resolve()
+            snapshot_download.assert_any_call(
+                repo_id="bartowski/Qwen_Qwen3.5-9B-GGUF",
+                local_dir=chat_dir,
+                allow_patterns=["Qwen_Qwen3.5-9B-Q4_K_M.gguf"],
+            )
+            self.assertIn(
+                {
+                    "role": "chat_gpu",
+                    "downloaded": True,
+                    "message": str(chat_dir),
+                },
+                results,
+            )
+
+    def test_download_reports_missing_remote_artifact_as_error(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp_dir:
+            settings = Settings(MODELS_DIR=tmp_dir)
+
+            with patch("huggingface_hub.snapshot_download"):
+                results = download_models(settings, "gpu")
+
+            self.assertFalse(all(result["downloaded"] for result in results))
+            self.assertTrue(
+                all(
+                    "no devolvió los artefactos esperados" in result["message"]
+                    for result in results
+                )
+            )
+
+    def test_download_command_exits_if_an_artifact_is_missing(self) -> None:
+        failed_result = [
+            {
+                "role": "chat_gpu",
+                "downloaded": False,
+                "message": "artefacto ausente",
+            }
+        ]
+        with (
+            patch("rag_cliente.cli.get_settings", return_value=Settings()),
+            patch("rag_cliente.cli.download_models", return_value=failed_result),
+            patch.object(sys, "argv", ["rag-cli", "models", "download", "gpu"]),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as exit_context:
+                cli_main()
+
+        self.assertEqual(exit_context.exception.code, 1)
 
 
 if __name__ == "__main__":

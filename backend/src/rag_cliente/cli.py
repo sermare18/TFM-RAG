@@ -135,8 +135,10 @@ def main() -> None:
         if args.models_command == "download":
             results = download_models(settings, args.profile)
             for result in results:
-                state = "DESCARGADO" if result["downloaded"] else "REUTILIZAR"
+                state = "DESCARGADO" if result["downloaded"] else "ERROR"
                 print(f"[{state}] {result['role']}: {result['message']}")
+            if not all(result["downloaded"] for result in results):
+                raise SystemExit(1)
             return
         if args.models_command == "check":
             selected_profile = args.profile
