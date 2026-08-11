@@ -29,14 +29,24 @@ class ModelRoleSpec:
 
 MODEL_MANIFEST: tuple[ModelRoleSpec, ...] = (
     ModelRoleSpec(
-        key="embeddings",
-        label="Embeddings Qwen3 0.6B",
+        key="embeddings_cpu",
+        label="Embeddings CPU Qwen3 0.6B",
         repository="Qwen/Qwen3-Embedding-0.6B-GGUF",
         directory="qwen3-embedding-0.6b",
         quantization="Q8_0",
         patterns=("*Q8_0*.gguf",),
         expected_size="aprox. 0.6-0.8 GiB",
-        profiles=("cpu", "gpu"),
+        profiles=("cpu",),
+    ),
+    ModelRoleSpec(
+        key="embeddings_gpu",
+        label="Embeddings GPU Qwen3 8B",
+        repository="Qwen/Qwen3-Embedding-8B-GGUF",
+        directory="qwen3-embedding-8b",
+        quantization="Q8_0",
+        patterns=("Qwen3-Embedding-8B-Q8_0.gguf", "*Q8_0*.gguf"),
+        expected_size="aprox. 7.5-8.5 GiB",
+        profiles=("gpu",),
     ),
     ModelRoleSpec(
         key="chat_cpu",
@@ -50,20 +60,21 @@ MODEL_MANIFEST: tuple[ModelRoleSpec, ...] = (
     ),
     ModelRoleSpec(
         key="chat_gpu",
-        label="Chat GPU Qwen3-VL 8B",
-        repository="Qwen/Qwen3-VL-8B-Instruct-GGUF",
-        directory="qwen3-vl-8b",
-        quantization="Q4_K_M",
-        patterns=("Qwen3VL-8B-Instruct-Q4_K_M.gguf", "*Q4_K_M*.gguf"),
-        expected_size="aprox. 4.5-5.5 GiB",
+        label="Chat GPU Qwen3 14B",
+        repository="Qwen/Qwen3-14B-GGUF",
+        directory="qwen3-14b",
+        quantization="Q5_K_M",
+        patterns=("Qwen3-14B-Q5_K_M.gguf", "*Q5_K_M*.gguf"),
+        expected_size="aprox. 9.5-11 GiB",
         profiles=("gpu",),
     ),
 )
 
 _EXPLICIT_PATH_FIELDS = {
-    "embeddings": "embeddings_gguf_path",
-    "chat_cpu": "chat_cpu_gguf_path",
-    "chat_gpu": "chat_gpu_gguf_path",
+    "embeddings_cpu": ("embeddings_cpu_gguf_path", "embeddings_gguf_path"),
+    "embeddings_gpu": ("embeddings_gpu_gguf_path", "embeddings_gguf_path"),
+    "chat_cpu": ("chat_cpu_gguf_path",),
+    "chat_gpu": ("chat_gpu_gguf_path",),
 }
 
 
@@ -79,9 +90,10 @@ def get_role(key: str) -> ModelRoleSpec:
 
 
 def resolve_model_path(settings: Settings, role: ModelRoleSpec) -> Path:
-    configured = str(getattr(settings, _EXPLICIT_PATH_FIELDS[role.key], "") or "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
+    for field_name in _EXPLICIT_PATH_FIELDS[role.key]:
+        configured = str(getattr(settings, field_name, "") or "").strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
 
     role_dir = (settings.models_path / role.directory).resolve()
     if role_dir.exists():

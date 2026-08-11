@@ -141,6 +141,22 @@ class ApiTests(unittest.TestCase):
 
 
 class LocalChatClientTests(unittest.TestCase):
+    def test_query_embeddings_include_instruction_but_documents_do_not(self) -> None:
+        client = LlamaCppClient(Settings(model_supervision_enabled=False))
+        client.embedding_client = Mock()
+        client.embedding_client.embeddings.create.return_value = types.SimpleNamespace(
+            data=[types.SimpleNamespace(embedding=[0.1, 0.2])]
+        )
+
+        client.embed_texts(["normativa de defensa"], query_mode=True)
+        query_input = client.embedding_client.embeddings.create.call_args.kwargs["input"]
+        self.assertTrue(query_input[0].startswith("Instruct: "))
+        self.assertTrue(query_input[0].endswith("Query: normativa de defensa"))
+
+        client.embed_texts(["contenido del documento"])
+        document_input = client.embedding_client.embeddings.create.call_args.kwargs["input"]
+        self.assertEqual(document_input, ["contenido del documento"])
+
     def test_prompt_keeps_history_and_page_context(self) -> None:
         messages = LlamaCppClient._build_messages(
             "Como me llamo?",
@@ -206,6 +222,10 @@ class RetrievalModeTests(unittest.TestCase):
             pipeline.store.search.return_value = []
             pipeline.bm25_store = Mock()
             self.assertEqual(pipeline._retrieve(["consulta"], top_k=3, tag="guias"), [])
+            pipeline.client.embed_texts.assert_called_once_with(
+                ["consulta"],
+                query_mode=True,
+            )
             pipeline.bm25_store.search.assert_not_called()
             pipeline.store.search.assert_called_once_with([0.1, 0.2], top_k=40, tag="guias")
 

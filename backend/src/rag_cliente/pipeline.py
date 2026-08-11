@@ -305,7 +305,7 @@ class RagPipeline:
             ):
                 self._ensure_models(("embeddings",))
                 try:
-                    query_vectors = self.client.embed_texts(queries)
+                    query_vectors = self.client.embed_texts(queries, query_mode=True)
                     vector_groups = [
                         self.store.search(
                             vector,

@@ -66,18 +66,29 @@ class LlamaCppClient:
         self,
         texts: list[str],
         progress_callback: ProgressCallback | None = None,
+        query_mode: bool = False,
     ) -> list[list[float]]:
         """Genera embeddings para una lista de textos en lotes pequeños."""
         if not texts:
             return []
 
+        prepared_texts = texts
+        instruction = self.settings.embedding_query_instruction.strip()
+        if query_mode and instruction:
+            prepared_texts = [
+                f"Instruct: {instruction}\nQuery: {text}" for text in texts
+            ]
+
         batch_size = max(1, self.settings.embedding_batch_size)
         embeddings: list[list[float]] = []
 
-        total_batches = (len(texts) + batch_size - 1) // batch_size
+        total_batches = (len(prepared_texts) + batch_size - 1) // batch_size
 
-        for batch_index, start in enumerate(range(0, len(texts), batch_size), start=1):
-            batch = texts[start : start + batch_size]
+        for batch_index, start in enumerate(
+            range(0, len(prepared_texts), batch_size),
+            start=1,
+        ):
+            batch = prepared_texts[start : start + batch_size]
             if progress_callback is not None:
                 progress_callback(
                     f"Embeddings lote {batch_index}/{total_batches} "
@@ -192,9 +203,9 @@ class LlamaCppClient:
                 emitted_answer = True
                 yield {"type": "answer", "delta": text}
 
-        # Qwen3.5 puede consumir todo su presupuesto sin cerrar el bloque de
-        # thinking. En ese caso completa el mismo flujo con una fase final sin
-        # thinking, que también se entrega token a token.
+        # Un modelo con razonamiento puede consumir todo su presupuesto sin
+        # cerrar el bloque de thinking. En ese caso completa el mismo flujo con
+        # una fase final sin thinking, que también se entrega token a token.
         if enable_reasoning and not emitted_answer:
             yield from self.stream_answer(
                 question,

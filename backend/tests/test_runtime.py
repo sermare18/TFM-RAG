@@ -45,17 +45,21 @@ class ModelRuntimeTests(unittest.TestCase):
     def test_model_profiles_contain_only_embeddings_and_chat(self) -> None:
         self.assertEqual(
             [role.key for role in roles_for_profile("cpu")],
-            ["embeddings", "chat_cpu"],
+            ["embeddings_cpu", "chat_cpu"],
         )
         self.assertEqual(
             [role.key for role in roles_for_profile("gpu")],
-            ["embeddings", "chat_gpu"],
+            ["embeddings_gpu", "chat_gpu"],
         )
+        gpu_embeddings = get_role("embeddings_gpu")
+        self.assertEqual(gpu_embeddings.directory, "qwen3-embedding-8b")
+        self.assertEqual(gpu_embeddings.quantization, "Q8_0")
         gpu_chat = get_role("chat_gpu")
-        self.assertEqual(gpu_chat.directory, "qwen3-vl-8b")
+        self.assertEqual(gpu_chat.directory, "qwen3-14b")
+        self.assertEqual(gpu_chat.quantization, "Q5_K_M")
         self.assertEqual(
             gpu_chat.patterns[0],
-            "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+            "Qwen3-14B-Q5_K_M.gguf",
         )
 
     def test_model_check_accepts_gguf_headers_without_loading(self) -> None:
@@ -67,7 +71,7 @@ class ModelRuntimeTests(unittest.TestCase):
             chat.write_bytes(b"GGUF" + b"0" * 32)
             settings = Settings(
                 local_model_profile="gpu",
-                embeddings_gguf_path=str(embedding),
+                embeddings_gpu_gguf_path=str(embedding),
                 chat_gpu_gguf_path=str(chat),
             )
             self.assertTrue(all(item["valid"] for item in check_models(settings, "gpu")))
@@ -96,6 +100,8 @@ class ModelRuntimeTests(unittest.TestCase):
             )
             command = ModelSupervisor(settings, specs={"embeddings": spec}).build_command(spec)
             self.assertIn("--embedding", command)
+            self.assertIn("--pooling", command)
+            self.assertIn("last", command)
             self.assertNotIn("--mmproj", command)
             self.assertNotIn("--hf-repo", command)
 

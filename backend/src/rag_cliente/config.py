@@ -101,6 +101,16 @@ class Settings(BaseSettings):
     )
     model_chat_mode: ModelServerMode = Field(default="managed", alias="MODEL_CHAT_MODE")
     local_model_hosts: str = Field(default="", alias="LOCAL_MODEL_HOSTS")
+    embeddings_cpu_gguf_path: str = Field(
+        default="",
+        alias="EMBEDDINGS_CPU_GGUF_PATH",
+    )
+    embeddings_gpu_gguf_path: str = Field(
+        default="",
+        alias="EMBEDDINGS_GPU_GGUF_PATH",
+    )
+    # Compatibilidad con configuraciones anteriores que compartían el mismo
+    # modelo de embeddings para CPU y GPU.
     embeddings_gguf_path: str = Field(default="", alias="EMBEDDINGS_GGUF_PATH")
     chat_cpu_gguf_path: str = Field(default="", alias="CHAT_CPU_GGUF_PATH")
     chat_gpu_gguf_path: str = Field(default="", alias="CHAT_GPU_GGUF_PATH")
@@ -183,7 +193,14 @@ class Settings(BaseSettings):
 
     max_tokens: int = Field(default=1024, alias="MAX_TOKENS", ge=1)
     reasoning_max_tokens: int = Field(default=1024, alias="REASONING_MAX_TOKENS", ge=1)
-    embedding_batch_size: int = Field(default=16, alias="EMBEDDING_BATCH_SIZE", ge=1)
+    embedding_batch_size: int = Field(default=4, alias="EMBEDDING_BATCH_SIZE", ge=1)
+    embedding_query_instruction: str = Field(
+        default=(
+            "Given a user question in Spanish, retrieve relevant passages from "
+            "the indexed documents that answer the question"
+        ),
+        alias="EMBEDDING_QUERY_INSTRUCTION",
+    )
 
     data_dir: str = Field(default="./data", alias="DATA_DIR")
     documents_dir: str = Field(default="./data/pdfs", alias="DOCUMENTS_DIR")

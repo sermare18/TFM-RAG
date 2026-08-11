@@ -23,6 +23,20 @@ y generación de respuestas mediante `llama.cpp`.
 Los `.md` entran directamente. Si contienen separadores `<!-- PAGE N -->`, se
 conserva la paginación; sin separadores se consideran una sola página.
 
+### Relación entre páginas, lotes y chunks
+
+Los lotes de cuatro páginas solo sirven para dar contexto visual a Bedrock
+durante la conversión y no se almacenan como una unidad. El indexador mantiene
+siempre la frontera de página: cada chunk pertenece a una única página y nunca
+mezcla contenido de páginas distintas.
+
+Una página corta genera normalmente un chunk. Una página larga puede generar
+varios, con los valores predeterminados de 700 tokens objetivo, 900 tokens
+máximos y 100 tokens de solapamiento. Una página vacía puede no generar ningún
+chunk. Todos los chunks conservan su número de página en `source_pages`,
+`page_start` y `page_end` para permitir recuperación, citas y evaluación por
+página.
+
 ## Configuración de Bedrock
 
 `.env.example` deja Bedrock desactivado para que una instalación nueva nunca
@@ -78,8 +92,15 @@ Los modelos locales nunca se descargan durante el indexado:
 .\rag.bat models check --profile gpu
 ```
 
-El perfil GPU conserva Qwen3 Embedding 0.6B y Qwen3-VL 8B para respuesta. El
-perfil CPU usa el mismo embedding y Qwen3 4B para respuesta.
+El perfil GPU usa Qwen3-Embedding-8B Q8_0 y Qwen3-14B Q5_K_M. El perfil CPU
+conserva Qwen3-Embedding-0.6B Q8_0 y Qwen3-4B Q4_K_M. El servidor de embeddings
+usa `pooling last` y añade a las consultas la instrucción configurada en
+`EMBEDDING_QUERY_INSTRUCTION`; el contenido de los documentos se indexa sin esa
+instrucción.
+
+Al cambiar el modelo de embeddings hay que ejecutar de nuevo `index` para
+recrear los vectores. La caché Markdown de Bedrock se reutiliza: no es necesario
+usar `--refresh-bedrock` ni volver a pagar la conversión de los PDF.
 
 ## Uso
 

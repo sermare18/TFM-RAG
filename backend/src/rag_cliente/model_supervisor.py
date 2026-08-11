@@ -106,9 +106,10 @@ def build_server_specs(settings: Settings) -> dict[str, ModelServerSpec]:
     """Resuelve cada rol a rutas GGUF locales explícitas."""
     profile = resolve_local_model_profile(settings)
     use_gpu = profile == "gpu"
+    embeddings_role = "embeddings_gpu" if use_gpu else "embeddings_cpu"
     chat_role = "chat_gpu" if use_gpu else "chat_cpu"
 
-    embeddings_model = resolve_runtime_model_path(settings, "embeddings")
+    embeddings_model = resolve_runtime_model_path(settings, embeddings_role)
     chat_model = resolve_runtime_model_path(settings, chat_role)
 
     gpu_layers = settings.model_gpu_layers if use_gpu else 0
@@ -198,7 +199,7 @@ class ModelSupervisor:
             str(spec.gpu_layers if spec.use_gpu else 0),
         ]
         if spec.embeddings:
-            command.append("--embedding")
+            command.extend(("--embedding", "--pooling", "last"))
         command.extend(spec.extra_args)
         if any(argument in {"-hf", "--hf-repo"} for argument in command):
             raise ValueError("La ejecución normal no permite -hf/--hf-repo")
