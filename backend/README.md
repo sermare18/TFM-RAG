@@ -82,6 +82,7 @@ BEDROCK_CONTEXT_PAGES=4
 BEDROCK_MAX_OUTPUT_TOKENS=16384
 BEDROCK_MAX_PAGES_PER_DOCUMENT=200
 BEDROCK_MAX_CALLS_PER_DOCUMENT=200
+BEDROCK_TRANSIENT_MAX_RETRIES=5
 ```
 
 Mientras esté desactivado, los PDF solo se indexan si ya existe una caché
@@ -164,6 +165,8 @@ su caché mediante `BEDROCK_PROMPT_VERSION`; no hace falta añadir
 
 `doctor` no llama a AWS ni consume tokens. El segundo comando sí realiza las
 llamadas necesarias y guarda el Markdown por página en `data/markdown`.
+Los errores temporales `503`, `500` y `ModelNotReady` se reintentan con espera
+exponencial y jitter antes de interrumpir el indexado.
 
 Cambiar `RETRIEVAL_MODE=vector|bm25|hybrid` y `RETRIEVAL_TOP_K` permite comparar
 configuraciones sobre el mismo índice. El resultado recuperado se colapsa por

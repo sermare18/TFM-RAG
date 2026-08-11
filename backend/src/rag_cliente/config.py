@@ -160,13 +160,19 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
+    bedrock_transient_max_retries: int = Field(
+        default=5,
+        alias="BEDROCK_TRANSIENT_MAX_RETRIES",
+        ge=0,
+        le=5,
+    )
     bedrock_reference_text_max_chars: int = Field(
         default=12000,
         alias="BEDROCK_REFERENCE_TEXT_MAX_CHARS",
         ge=0,
     )
     bedrock_prompt_version: str = Field(
-        default="claude-sonnet-4-6-target-third-validated-v4",
+        default="claude-sonnet-4-6-target-third-quoted-v5",
         alias="BEDROCK_PROMPT_VERSION",
     )
     bedrock_cache_dir: str = Field(

@@ -118,6 +118,28 @@ class MinuteQuotaClient:
         raise MinuteQuotaError()
 
 
+class ServiceUnavailableError(RuntimeError):
+    response = {
+        "Error": {
+            "Code": "ServiceUnavailableException",
+            "Message": "Bedrock is unable to process your request.",
+        }
+    }
+
+
+class TransientThenCompleteClient(FakeBedrockClient):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+
+    def converse(self, **kwargs):
+        if self.failures:
+            self.calls.append(kwargs)
+            self.failures -= 1
+            raise ServiceUnavailableError()
+        return super().converse(**kwargs)
+
+
 class InferenceProfileError(RuntimeError):
     response = {
         "Error": {
@@ -142,6 +164,19 @@ class BedrockParserTests(unittest.TestCase):
             bedrock_context_pages=4,
             bedrock_max_output_tokens=16384,
             model_supervision_enabled=False,
+        )
+
+    def test_quote_entities_are_restored_after_json_parsing(self) -> None:
+        response = json.dumps(
+            {"markdown": "Título **&quot;Organización del trabajo&quot;**"},
+            ensure_ascii=False,
+        )
+
+        page = BedrockMarkdownParser._parse_target_response(response, 16)
+
+        self.assertEqual(
+            page.markdown,
+            'Título **"Organización del trabajo"**',
         )
 
     def test_each_target_page_gets_one_call_with_a_four_page_context(self) -> None:
@@ -184,6 +219,11 @@ class BedrockParserTests(unittest.TestCase):
                 {"type": "string"},
             )
             self.assertIn("TARGET PAGE image is the primary", BEDROCK_SYSTEM_PROMPT)
+            self.assertIn("HTML entity &quot;", BEDROCK_SYSTEM_PROMPT)
+            self.assertIn(
+                "Never emit literal straight or typographic double quotation marks",
+                BEDROCK_SYSTEM_PROMPT,
+            )
 
             target_labels = []
             for call in client.calls:
@@ -407,6 +447,36 @@ class BedrockParserTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "tokens por minuto"):
                 parser.parse_pdf(source)
+
+    def test_service_unavailable_retries_with_exponential_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "document.pdf"
+            source.write_bytes(b"synthetic-pdf")
+            client = TransientThenCompleteClient(failures=2)
+            delays: list[float] = []
+            progress: list[str] = []
+            parser = BedrockMarkdownParser(
+                self.make_settings(root / "cache"),
+                client,
+                sleep=delays.append,
+                jitter=lambda: 0.0,
+            )
+            parser._render_pdf = lambda _source: [(1, b"png", "reference")]
+
+            document = parser.parse_pdf(source, progress_callback=progress.append)
+
+            self.assertEqual(document.pages[0].page_number, 1)
+            self.assertEqual(len(client.calls), 3)
+            self.assertEqual(delays, [0.5, 1.0])
+            self.assertTrue(
+                any("reintento 1/5" in message for message in progress),
+                progress,
+            )
+            self.assertTrue(
+                any("reintento 2/5" in message for message in progress),
+                progress,
+            )
 
     def test_inference_profile_error_shows_the_required_global_id(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

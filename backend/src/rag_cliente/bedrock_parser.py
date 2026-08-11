@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import time
 from collections import Counter
@@ -28,6 +29,12 @@ _PAGE_SEPARATOR_RE = re.compile(r"^<!--\s*PAGE\s+(\d+)\s*-->\s*$", re.MULTILINE)
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _MIN_REFERENCE_TOKENS = 40
 _MIN_REFERENCE_COVERAGE = 0.65
+_TRANSIENT_BEDROCK_CODES = {
+    "InternalServerException",
+    "ModelNotReadyException",
+    "ServiceUnavailableException",
+}
+_TRANSIENT_RETRY_MAX_DELAY_SECONDS = 16.0
 
 BEDROCK_SYSTEM_PROMPT = """You convert document page images into faithful Markdown.
 
@@ -52,6 +59,10 @@ Rules:
 8. Do not summarize, explain, translate or invent content.
 9. Return valid JSON only with one string property named markdown. That property
    must contain the complete Markdown for the TARGET PAGE and nothing else.
+10. Encode every visible double quotation mark as the HTML entity &quot; inside
+    Markdown. Never emit literal straight or typographic double quotation marks
+    in the markdown value. This preserves quoted text without confusing the JSON
+    string boundary.
 """
 
 
@@ -138,9 +149,18 @@ def _pages_from_markdown(markdown: str) -> list[MarkdownPage]:
 class BedrockMarkdownParser:
     """Cliente pequeño, inyectable y con caché para Bedrock Converse."""
 
-    def __init__(self, settings: Settings, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: Any | None = None,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
         self.settings = settings
         self._client = client
+        self._sleep = sleep
+        self._jitter = jitter
 
     def _runtime_client(self) -> Any:
         if self._client is not None:
@@ -347,6 +367,9 @@ class BedrockMarkdownParser:
                 "Bedrock no devolvió Markdown para la página objetivo "
                 f"{target_page}"
             )
+        # The prompt encodes visible double quotes to avoid a Claude structured-
+        # output boundary bug. Restore ordinary Markdown only after JSON parsing.
+        markdown = markdown.replace("&quot;", '"')
         return MarkdownPage(target_page, markdown.strip())
 
     @staticmethod
@@ -420,79 +443,111 @@ class BedrockMarkdownParser:
         start = max(0, min(start, len(rendered) - size))
         return rendered[start : start + size]
 
-    def _converse_target(self, content: list[dict[str, Any]]) -> dict[str, Any]:
-        try:
-            return self._runtime_client().converse(
-                modelId=self.settings.bedrock_model_id,
-                system=[{"text": BEDROCK_SYSTEM_PROMPT}],
-                messages=[{"role": "user", "content": content}],
-                inferenceConfig={
-                    "maxTokens": self.settings.bedrock_max_output_tokens,
-                    "temperature": 0.0,
-                },
-                outputConfig={
-                    "textFormat": {
-                        "type": "json_schema",
-                        "structure": {
-                            "jsonSchema": {
-                                "schema": json.dumps(
-                                    _target_page_output_schema(),
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ),
-                                "name": "target_page",
-                                "description": (
-                                    "Faithful Markdown extraction of the single "
-                                    "target PDF page."
-                                ),
-                            }
-                        },
-                    }
-                },
-            )
-        except Exception as exc:
-            error = getattr(exc, "response", {}).get("Error", {})
-            code = str(error.get("Code") or "")
-            message = str(error.get("Message") or exc)
-            normalized = message.lower()
-            if code == "ThrottlingException" and "tokens per day" in normalized:
-                raise RuntimeError(
-                    "Amazon Bedrock ha agotado la cuota diaria de tokens para "
-                    f"'{self.settings.bedrock_model_id}'. Las páginas ya completadas "
-                    "quedan guardadas en caché. Espera al reinicio diario o solicita "
-                    "un aumento en AWS Service Quotas."
-                ) from None
-            if code == "ThrottlingException" and "tokens per minute" in normalized:
-                raise RuntimeError(
-                    "Amazon Bedrock ha alcanzado temporalmente la cuota global de "
-                    "tokens por minuto para Claude Sonnet 4.6. Las páginas ya "
-                    "completadas quedan guardadas; espera un minuto y reanuda."
-                ) from None
-            if code == "ThrottlingException":
-                raise RuntimeError(
-                    "Amazon Bedrock ha limitado temporalmente la petición. "
-                    "Vuelve a intentarlo cuando haya capacidad disponible."
-                ) from None
-            if code == "ResourceNotFoundException" and "use case" in normalized:
-                raise RuntimeError(
-                    "AWS exige enviar el formulario de caso de uso de Anthropic "
-                    "antes de utilizar este modelo; complétalo en la consola de "
-                    "Amazon Bedrock y espera unos minutos."
-                ) from None
-            if code == "ValidationException" and "inference profile" in normalized:
-                raise RuntimeError(
-                    "Bedrock requiere el perfil de inferencia global de Claude "
-                    f"Sonnet 4.6. Configura BEDROCK_MODEL_ID="
-                    f"{CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID}."
-                ) from None
-            if code in {"AccessDeniedException", "UnauthorizedOperation"}:
-                raise RuntimeError(
-                    "El perfil AWS no tiene permiso para invocar este modelo de "
-                    "Bedrock. Revisa bedrock:InvokeModel y el perfil de inferencia."
-                ) from None
-            if code:
-                raise RuntimeError(f"Amazon Bedrock devolvió {code}: {message}") from None
-            raise
+    def _converse_target(
+        self,
+        content: list[dict[str, Any]],
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        max_retries = self.settings.bedrock_transient_max_retries
+        for attempt in range(max_retries + 1):
+            try:
+                return self._runtime_client().converse(
+                    modelId=self.settings.bedrock_model_id,
+                    system=[{"text": BEDROCK_SYSTEM_PROMPT}],
+                    messages=[{"role": "user", "content": content}],
+                    inferenceConfig={
+                        "maxTokens": self.settings.bedrock_max_output_tokens,
+                        "temperature": 0.0,
+                    },
+                    outputConfig={
+                        "textFormat": {
+                            "type": "json_schema",
+                            "structure": {
+                                "jsonSchema": {
+                                    "schema": json.dumps(
+                                        _target_page_output_schema(),
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    ),
+                                    "name": "target_page",
+                                    "description": (
+                                        "Faithful Markdown extraction of the single "
+                                        "target PDF page."
+                                    ),
+                                }
+                            },
+                        }
+                    },
+                )
+            except Exception as exc:
+                error = getattr(exc, "response", {}).get("Error", {})
+                code = str(error.get("Code") or "")
+                if code in _TRANSIENT_BEDROCK_CODES and attempt < max_retries:
+                    base_delay = min(
+                        _TRANSIENT_RETRY_MAX_DELAY_SECONDS,
+                        float(2**attempt),
+                    )
+                    delay = base_delay * (0.5 + (self._jitter() * 0.5))
+                    _emit(
+                        progress_callback,
+                        f"Bedrock temporalmente no disponible ({code}); "
+                        f"reintento {attempt + 1}/{max_retries} en {delay:.1f} s",
+                    )
+                    self._sleep(delay)
+                    continue
+
+                self._raise_bedrock_error(exc, attempts=attempt + 1)
+
+        raise AssertionError("bucle de reintentos Bedrock agotado sin resultado")
+
+    def _raise_bedrock_error(self, exc: Exception, *, attempts: int) -> None:
+        error = getattr(exc, "response", {}).get("Error", {})
+        code = str(error.get("Code") or "")
+        message = str(error.get("Message") or exc)
+        normalized = message.lower()
+        if code in _TRANSIENT_BEDROCK_CODES:
+            raise RuntimeError(
+                "Amazon Bedrock sigue temporalmente no disponible tras "
+                f"{attempts} intentos ({code}): {message}"
+            ) from None
+        if code == "ThrottlingException" and "tokens per day" in normalized:
+            raise RuntimeError(
+                "Amazon Bedrock ha agotado la cuota diaria de tokens para "
+                f"'{self.settings.bedrock_model_id}'. Las páginas ya completadas "
+                "quedan guardadas en caché. Espera al reinicio diario o solicita "
+                "un aumento en AWS Service Quotas."
+            ) from None
+        if code == "ThrottlingException" and "tokens per minute" in normalized:
+            raise RuntimeError(
+                "Amazon Bedrock ha alcanzado temporalmente la cuota global de "
+                "tokens por minuto para Claude Sonnet 4.6. Las páginas ya "
+                "completadas quedan guardadas; espera un minuto y reanuda."
+            ) from None
+        if code == "ThrottlingException":
+            raise RuntimeError(
+                "Amazon Bedrock ha limitado temporalmente la petición. "
+                "Vuelve a intentarlo cuando haya capacidad disponible."
+            ) from None
+        if code == "ResourceNotFoundException" and "use case" in normalized:
+            raise RuntimeError(
+                "AWS exige enviar el formulario de caso de uso de Anthropic "
+                "antes de utilizar este modelo; complétalo en la consola de "
+                "Amazon Bedrock y espera unos minutos."
+            ) from None
+        if code == "ValidationException" and "inference profile" in normalized:
+            raise RuntimeError(
+                "Bedrock requiere el perfil de inferencia global de Claude "
+                f"Sonnet 4.6. Configura BEDROCK_MODEL_ID="
+                f"{CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID}."
+            ) from None
+        if code in {"AccessDeniedException", "UnauthorizedOperation"}:
+            raise RuntimeError(
+                "El perfil AWS no tiene permiso para invocar este modelo de "
+                "Bedrock. Revisa bedrock:InvokeModel y el perfil de inferencia."
+            ) from None
+        if code:
+            raise RuntimeError(f"Amazon Bedrock devolvió {code}: {message}") from None
+        raise exc
 
     def _invoke_target(
         self,
@@ -587,7 +642,10 @@ class BedrockMarkdownParser:
                             )
                         }
                     )
-            response = self._converse_target(request_content)
+            response = self._converse_target(
+                request_content,
+                progress_callback=progress_callback,
+            )
             try:
                 return self._validated_target_page(
                     response,
