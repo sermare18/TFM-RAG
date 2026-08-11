@@ -6,11 +6,13 @@ import json
 import re
 from typing import Any, Callable
 
+import httpx
 from openai import OpenAI
 
 ProgressCallback = Callable[[str], None]
 
 from rag_cliente.config import Settings
+from rag_cliente.local_endpoints import is_local_model_endpoint
 
 
 class LlamaCppClient:
@@ -26,16 +28,38 @@ class LlamaCppClient:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        for role, endpoint in (
+            ("chat", settings.llama_cpp_chat_base_url),
+            ("embeddings", settings.llama_cpp_embedding_base_url),
+        ):
+            if not is_local_model_endpoint(
+                endpoint,
+                settings.allowed_local_model_hosts,
+            ):
+                raise ValueError(
+                    f"El endpoint de {role} debe ser local; recibido: {endpoint}"
+                )
+        request_timeout = httpx.Timeout(
+            connect=min(
+                settings.model_health_connect_timeout,
+                settings.model_request_timeout,
+            ),
+            read=settings.model_request_timeout,
+            write=settings.model_request_timeout,
+            pool=settings.model_request_timeout,
+        )
 
         self.chat_client = OpenAI(
             base_url=settings.llama_cpp_chat_base_url,
             api_key=settings.openai_api_key,
-            timeout=settings.request_timeout,
+            timeout=request_timeout,
+            max_retries=settings.model_max_retries,
         )
         self.embedding_client = OpenAI(
             base_url=settings.llama_cpp_embedding_base_url,
             api_key=settings.openai_api_key,
-            timeout=settings.request_timeout,
+            timeout=request_timeout,
+            max_retries=settings.model_max_retries,
         )
 
     def embed_texts(
@@ -72,26 +96,20 @@ class LlamaCppClient:
         question: str,
         messages: list[dict[str, str]] | None = None,
     ) -> str:
-        """Convierte una follow-up en una consulta autocontenida para retrieval."""
+        """Reescritura determinista: nunca carga ni consulta el modelo de chat."""
         normalized_history = self._normalize_messages(messages or [])
         if not normalized_history:
             return question
-
-        try:
-            response = self.chat_client.chat.completions.create(
-                model=self.settings.default_endpoint_model,
-                temperature=0.0,
-                max_tokens=min(self.settings.max_tokens, 256),
-                messages=self._build_rewrite_messages(question, normalized_history),
-                extra_body=self._thinking_extra_body(False),
-            )
-        except Exception:
+        previous_user_messages = [
+            message["content"]
+            for message in normalized_history
+            if message["role"] == "user"
+        ]
+        if not previous_user_messages:
             return question
-
-        message = response.choices[0].message
-        content = getattr(message, "content", None)
-        rewritten_question = content.strip() if isinstance(content, str) else ""
-        return rewritten_question or question
+        # La variante contextual completa se añade después en RagPipeline. Esta
+        # función conserva la pregunta literal y evita cualquier dependencia de chat.
+        return question
 
     def generate_answer(
         self,

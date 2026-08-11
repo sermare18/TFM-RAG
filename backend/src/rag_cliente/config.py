@@ -35,6 +35,7 @@ load_dotenv()
 
 
 MarkerProfileName = Literal["cpu-digital", "cpu-quality", "gpu-quality", "auto"]
+ModelServerMode = Literal["managed", "external"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +73,7 @@ _MARKER_PROFILES: dict[str, ResolvedMarkerProfile] = {
         disable_ocr=False,
         use_llm=True,
         torch_device="cuda",
-        inference_backend=None,
+        inference_backend="llamacpp",
     ),
 }
 
@@ -120,6 +121,111 @@ class Settings(BaseSettings):
         alias="LLAMA_CPP_EMBEDDING_BASE_URL",
     )
     openai_api_key: str = Field(default="local-dev-key", alias="OPENAI_API_KEY")
+
+    # ===================================================================
+    # SUPERVISOR LOCAL DE LLAMA.CPP
+    # ===================================================================
+    # Se mantiene desactivado por defecto para que instalaciones existentes que
+    # ya administran sus endpoints sigan funcionando. `.env.example` lo activa.
+    model_supervision_enabled: bool = Field(
+        default=False,
+        alias="MODEL_SUPERVISION_ENABLED",
+    )
+    llama_cpp_binary: str = Field(
+        default=r"C:\Users\SergioMartinReizabal\Documents\llama.cpp\llama-server.exe",
+        alias="LLAMA_CPP_BINARY",
+    )
+    models_dir: str = Field(default="./models", alias="MODELS_DIR")
+    model_logs_dir: str = Field(default="./data/logs/models", alias="MODEL_LOGS_DIR")
+
+    model_start_timeout: float = Field(default=180.0, alias="MODEL_START_TIMEOUT", gt=0)
+    model_request_timeout: float = Field(default=180.0, alias="MODEL_REQUEST_TIMEOUT", gt=0)
+    model_stop_timeout: float = Field(default=15.0, alias="MODEL_STOP_TIMEOUT", gt=0)
+    parser_job_timeout: float = Field(default=1800.0, alias="PARSER_JOB_TIMEOUT", gt=0)
+    model_max_retries: int = Field(default=1, alias="MODEL_MAX_RETRIES", ge=0, le=1)
+    model_health_connect_timeout: float = Field(
+        default=5.0,
+        alias="MODEL_HEALTH_CONNECT_TIMEOUT",
+        gt=0,
+    )
+    model_health_read_timeout: float = Field(
+        default=10.0,
+        alias="MODEL_HEALTH_READ_TIMEOUT",
+        gt=0,
+    )
+    model_chat_idle_timeout: float = Field(
+        default=300.0,
+        alias="MODEL_CHAT_IDLE_TIMEOUT",
+        ge=0,
+    )
+    model_gpu_layers: int = Field(default=999, alias="MODEL_GPU_LAYERS", ge=0)
+    model_context_size: int = Field(default=16384, alias="MODEL_CONTEXT_SIZE", ge=8192)
+
+    model_surya_mode: ModelServerMode = Field(default="managed", alias="MODEL_SURYA_MODE")
+    model_vlm_mode: ModelServerMode = Field(default="managed", alias="MODEL_VLM_MODE")
+    model_embeddings_mode: ModelServerMode = Field(
+        default="managed",
+        alias="MODEL_EMBEDDINGS_MODE",
+    )
+    model_chat_mode: ModelServerMode = Field(default="managed", alias="MODEL_CHAT_MODE")
+
+    surya_base_url: str = Field(default="http://127.0.0.1:8084/v1", alias="SURYA_BASE_URL")
+    marker_openai_base_url: str = Field(
+        default="http://127.0.0.1:8083/v1",
+        alias="MARKER_OPENAI_BASE_URL",
+    )
+    marker_openai_model: str = Field(default="marker-vlm", alias="MARKER_OPENAI_MODEL")
+    local_model_hosts: str = Field(default="", alias="LOCAL_MODEL_HOSTS")
+
+    surya_gguf_path: str = Field(default="", alias="SURYA_GGUF_PATH")
+    surya_mmproj_path: str = Field(default="", alias="SURYA_MMPROJ_PATH")
+    vlm_cpu_gguf_path: str = Field(default="", alias="VLM_CPU_GGUF_PATH")
+    vlm_cpu_mmproj_path: str = Field(default="", alias="VLM_CPU_MMPROJ_PATH")
+    vlm_gpu_gguf_path: str = Field(default="", alias="VLM_GPU_GGUF_PATH")
+    vlm_gpu_mmproj_path: str = Field(default="", alias="VLM_GPU_MMPROJ_PATH")
+    vlm_gpu_custom_gguf_path: str = Field(default="", alias="VLM_GPU_CUSTOM_GGUF_PATH")
+    vlm_gpu_custom_mmproj_path: str = Field(
+        default="",
+        alias="VLM_GPU_CUSTOM_MMPROJ_PATH",
+    )
+    embeddings_gguf_path: str = Field(default="", alias="EMBEDDINGS_GGUF_PATH")
+    chat_cpu_gguf_path: str = Field(default="", alias="CHAT_CPU_GGUF_PATH")
+    chat_gpu_gguf_path: str = Field(default="", alias="CHAT_GPU_GGUF_PATH")
+
+    # ===================================================================
+    # PRESUPUESTOS DEL VLM DE MARKER
+    # ===================================================================
+    marker_llm_max_requests: int = Field(default=50, alias="MARKER_LLM_MAX_REQUESTS", ge=1)
+    marker_llm_max_tokens_per_request: int = Field(
+        default=4096,
+        alias="MARKER_LLM_MAX_TOKENS_PER_REQUEST",
+        ge=1,
+    )
+    marker_llm_max_generated_tokens_per_document: int = Field(
+        default=20000,
+        alias="MARKER_LLM_MAX_GENERATED_TOKENS_PER_DOCUMENT",
+        ge=1,
+    )
+    marker_llm_request_timeout: float = Field(
+        default=180.0,
+        alias="MARKER_LLM_REQUEST_TIMEOUT",
+        gt=0,
+    )
+    marker_llm_job_timeout: float = Field(
+        default=1800.0,
+        alias="MARKER_LLM_JOB_TIMEOUT",
+        gt=0,
+    )
+    marker_llm_max_retries: int = Field(
+        default=1,
+        alias="MARKER_LLM_MAX_RETRIES",
+        ge=0,
+        le=1,
+    )
+    marker_llm_fallback_to_base: bool = Field(
+        default=False,
+        alias="MARKER_LLM_FALLBACK_TO_BASE",
+    )
 
     # ===================================================================
     # BASE DE DATOS VECTORIAL - LANCEDB
@@ -181,8 +287,8 @@ class Settings(BaseSettings):
         alias="MARKER_PROFILE",
     )
 
-    # cpu-quality usa el backend llama.cpp de Surya. La ruta sigue siendo
-    # configurable para otros ordenadores.
+    # Alias obsoleto conservado para que un `.env` de fase 1 siga cargando. La
+    # ejecución de fase 2 valida y utiliza exclusivamente LLAMA_CPP_BINARY.
     marker_llama_cpp_binary: str = Field(
         default=r"C:\Users\SergioMartinReizabal\Documents\llama.cpp\llama-server.exe",
         alias="MARKER_LLAMA_CPP_BINARY",
@@ -223,7 +329,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @field_validator("llama_cpp_chat_base_url", "llama_cpp_embedding_base_url")
+    @field_validator(
+        "llama_cpp_chat_base_url",
+        "llama_cpp_embedding_base_url",
+        "surya_base_url",
+        "marker_openai_base_url",
+    )
     @classmethod
     def reject_server_bind_addresses(cls, value: str) -> str:
         """Impide usar una direccion de escucha como destino HTTP cliente."""
@@ -234,6 +345,13 @@ class Settings(BaseSettings):
                 "usa 127.0.0.1, localhost o la IP real del servidor"
             )
         return value.rstrip("/")
+
+    @field_validator("model_context_size")
+    @classmethod
+    def validate_initial_model_context(cls, value: int) -> int:
+        if value not in {8192, 16384}:
+            raise ValueError("MODEL_CONTEXT_SIZE debe ser 8192 o 16384 en esta fase")
+        return value
 
     @property
     def data_path(self) -> Path:
@@ -249,6 +367,25 @@ class Settings(BaseSettings):
     def documents_path(self) -> Path:
         """Convierte `documents_dir` a Path para operaciones con rutas."""
         return Path(self.documents_dir)
+
+    @property
+    def models_path(self) -> Path:
+        """Directorio local que contiene exclusivamente artefactos de modelos."""
+        return Path(self.models_dir)
+
+    @property
+    def model_logs_path(self) -> Path:
+        """Directorio de logs de los procesos creados por el supervisor."""
+        return Path(self.model_logs_dir)
+
+    @property
+    def allowed_local_model_hosts(self) -> set[str]:
+        """Hosts locales adicionales permitidos, separados por comas."""
+        return {
+            host.strip().lower()
+            for host in self.local_model_hosts.split(",")
+            if host.strip()
+        }
     
     @property
     def bm25_index_path(self) -> Path:

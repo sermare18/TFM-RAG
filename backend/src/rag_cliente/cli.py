@@ -8,9 +8,12 @@ Comandos disponibles:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
-from rag_cliente.config import get_settings
+from rag_cliente.config import get_settings, resolve_marker_profile
+from rag_cliente.diagnostics import run_doctor
+from rag_cliente.model_manifest import check_models, download_models, plan_models
 from rag_cliente.pipeline import RagPipeline
 
 
@@ -43,6 +46,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable model thinking for this request and show its reasoning.",
     )
 
+    subparsers.add_parser(
+        "doctor",
+        help="Validate hardware, llama.cpp, disk, profiles and local configuration.",
+    )
+
+    models_parser = subparsers.add_parser("models", help="Plan, download or validate local GGUF files.")
+    models_subparsers = models_parser.add_subparsers(dest="models_command", required=True)
+    for command in ("plan", "download"):
+        command_parser = models_subparsers.add_parser(command)
+        command_parser.add_argument("profile", choices=("cpu", "gpu"))
+    check_parser = models_subparsers.add_parser("check")
+    check_parser.add_argument("--profile", choices=("cpu", "gpu"), default=None)
+
     return parser
 
 
@@ -58,11 +74,61 @@ def _print_sources(citations: list[dict]) -> None:
         )
 
 
+def _print_model_reports(reports: list[dict]) -> None:
+    for report in reports:
+        state = "OK" if report["valid"] else "PENDIENTE"
+        repository = report.get("repository") or "ruta local configurable"
+        print(f"[{state}] {report['label']} ({report['quantization']})")
+        print(f"  repo: {repository}")
+        for artifact in report["artifacts"]:
+            artifact_state = "OK" if artifact["valid"] else "--"
+            expected = artifact.get("expected_size", "tamaño configurable")
+            patterns = ", ".join(artifact.get("patterns", []))
+            pattern_label = f"; archivos: {patterns}" if patterns else ""
+            print(
+                f"  [{artifact_state}] {artifact['kind']}: {artifact['path']} "
+                f"({expected}{pattern_label}; {artifact['message']}; "
+                f"reutilizable={'sí' if artifact['valid'] else 'no'})"
+            )
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
     settings = get_settings()
+
+    if args.command == "doctor":
+        report = run_doctor(settings)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if not report["ok"]:
+            raise SystemExit(1)
+        return
+
+    if args.command == "models":
+        if args.models_command == "plan":
+            _print_model_reports(plan_models(settings, args.profile))
+            return
+        if args.models_command == "download":
+            results = download_models(settings, args.profile)
+            for result in results:
+                state = "DESCARGADO" if result["downloaded"] else "REUTILIZAR"
+                print(f"[{state}] {result['role']}: {result['message']}")
+            return
+        if args.models_command == "check":
+            selected_profile = args.profile
+            if selected_profile is None:
+                selected_profile = (
+                    "gpu"
+                    if resolve_marker_profile(settings).name == "gpu-quality"
+                    else "cpu"
+                )
+            reports = check_models(settings, selected_profile)
+            _print_model_reports(reports)
+            if not all(report["valid"] for report in reports):
+                raise SystemExit(1)
+            return
+
     settings.lancedb_path.mkdir(parents=True, exist_ok=True)
     pipeline = RagPipeline(settings)
 

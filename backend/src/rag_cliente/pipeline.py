@@ -5,14 +5,20 @@ recuperación y generación.
 """
 from __future__ import annotations
 
+import gc
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from rag_cliente.bm25_store import BM25Store
-from rag_cliente.config import Settings
+from rag_cliente.config import Settings, resolve_marker_profile
 from rag_cliente.indexer import PdfChunker
 from rag_cliente.llm_client import LlamaCppClient
+from rag_cliente.model_supervisor import ModelSupervisor
 from rag_cliente.pdf_loader import load_documents_from_directory
+from rag_cliente.resource_coordinator import get_resource_coordinator
 from rag_cliente.vector_store import LanceDBStore
 
 ProgressCallback = Callable[[str], None]
@@ -27,6 +33,41 @@ class RagPipeline:
         self.chunker = PdfChunker(settings)
         self.store = LanceDBStore(settings.lancedb_path, settings.lancedb_table)
         self.bm25_store = BM25Store(settings.bm25_index_path)
+        self.coordinator = get_resource_coordinator()
+        self.supervisor = (
+            ModelSupervisor(settings)
+            if settings.model_supervision_enabled
+            else None
+        )
+
+    def _ensure_models(self, roles: tuple[str, ...]) -> None:
+        if self.supervisor is None:
+            return
+        started: list[str] = []
+        try:
+            for role in roles:
+                self.supervisor.ensure_started(role)
+                started.append(role)
+        except BaseException:
+            self.supervisor.stop_bundle(started)
+            raise
+
+    def _stop_models(self, roles: tuple[str, ...]) -> None:
+        if self.supervisor is not None:
+            self.supervisor.stop_bundle(roles)
+
+    @staticmethod
+    def _release_model_memory() -> None:
+        """Libera referencias Python/CUDA sin importar frameworks nuevos."""
+        gc.collect()
+        torch_module = sys.modules.get("torch")
+        cuda = getattr(torch_module, "cuda", None)
+        if cuda is not None:
+            try:
+                if cuda.is_available():
+                    cuda.empty_cache()
+            except (AttributeError, RuntimeError):
+                pass
 
     @staticmethod
     def _emit(progress_callback: ProgressCallback | None, message: str) -> None:
@@ -48,45 +89,75 @@ class RagPipeline:
         4. persistir en LanceDB
         """
         self._emit(progress_callback, f"Iniciando indexado en: {doc_dir}")
-        pages = load_documents_from_directory(
-            doc_dir,
-            settings=self.settings,
-            progress_callback=progress_callback,
-        )
-        self._emit(progress_callback, f"Total de páginas/bloques extraídos: {len(pages)}")
+        with self.coordinator.acquire_indexing(timeout=self.settings.parser_job_timeout):
+            parser_started_at = time.monotonic()
+            with self.coordinator.acquire(
+                "parser_bundle",
+                workload="index",
+                timeout=self.settings.parser_job_timeout,
+            ):
+                profile = resolve_marker_profile(self.settings)
+                parser_roles = ("surya", "vlm") if profile.use_llm else ()
+                self._ensure_models(parser_roles)
+                try:
+                    pages = load_documents_from_directory(
+                        doc_dir,
+                        settings=self.settings,
+                        progress_callback=progress_callback,
+                    )
+                    parser_elapsed = time.monotonic() - parser_started_at
+                    if parser_elapsed > self.settings.parser_job_timeout:
+                        raise TimeoutError(
+                            f"PARSER_JOB_TIMEOUT excedido: {parser_elapsed:.1f}s"
+                        )
+                finally:
+                    self._stop_models(parser_roles)
+                    self._release_model_memory()
 
-        normalized_tag = (tag or "").strip()
-        if normalized_tag:
-            self._emit(progress_callback, f"Aplicando tag a los chunks: {normalized_tag}")
+            self._emit(progress_callback, f"Total de páginas/bloques extraídos: {len(pages)}")
 
-        self._emit(progress_callback, "Chunking de documentos...")
-        chunks = self.chunker.chunk_pages(pages, tag=normalized_tag or None)
-        self._emit(progress_callback, f"Chunks generados: {len(chunks)}")
-        if not chunks:
-            self._emit(progress_callback, "Indexado completado: no hay chunks para guardar.")
-            return 0
+            normalized_tag = (tag or "").strip()
+            if normalized_tag:
+                self._emit(progress_callback, f"Aplicando tag a los chunks: {normalized_tag}")
 
-        self._emit(
-            progress_callback,
-            f"Generando embeddings en lotes de {max(1, self.settings.embedding_batch_size)}...",
-        )
-        embeddings = self.client.embed_texts(
-            [chunk.text for chunk in chunks],
-            progress_callback=progress_callback,
-        )
+            self._emit(progress_callback, "Chunking de documentos...")
+            chunks = self.chunker.chunk_pages(pages, tag=normalized_tag or None)
+            self._emit(progress_callback, f"Chunks generados: {len(chunks)}")
+            if not chunks:
+                self._emit(progress_callback, "Indexado completado: no hay chunks para guardar.")
+                return 0
 
-        self._emit(progress_callback, f"Guardando {len(chunks)} chunks en LanceDB...")
-        self.store.replace_chunks(chunks, embeddings)
+            self._emit(
+                progress_callback,
+                f"Generando embeddings en lotes de {max(1, self.settings.embedding_batch_size)}...",
+            )
+            with self.coordinator.acquire(
+                "embeddings",
+                workload="index",
+                timeout=self.settings.parser_job_timeout,
+            ):
+                self._ensure_models(("embeddings",))
+                try:
+                    embeddings = self.client.embed_texts(
+                        [chunk.text for chunk in chunks],
+                        progress_callback=progress_callback,
+                    )
+                finally:
+                    self._stop_models(("embeddings",))
+                    self._release_model_memory()
 
-        if self.settings.hybrid_search_enabled:
-            self._emit(progress_callback, "Guardando índice BM25 para búsqueda híbrida...")
-            self.bm25_store.replace_chunks(chunks)
+            self._emit(progress_callback, f"Guardando {len(chunks)} chunks en LanceDB...")
+            self.store.replace_chunks(chunks, embeddings)
 
-        self._emit(
-            progress_callback,
-            f"Indexado completado en tabla '{self.settings.lancedb_table}'.",
-        )
-        return len(chunks)
+            if self.settings.hybrid_search_enabled:
+                self._emit(progress_callback, "Guardando índice BM25 para búsqueda híbrida...")
+                self.bm25_store.replace_chunks(chunks)
+
+            self._emit(
+                progress_callback,
+                f"Indexado completado en tabla '{self.settings.lancedb_table}'.",
+            )
+            return len(chunks)
     
     @staticmethod
     def _is_contextual_retrieval_query(query: str) -> bool:
@@ -396,13 +467,27 @@ class RagPipeline:
         
         # FIN debug
 
-        query_vectors = self.client.embed_texts(retrieval_queries)
         normalized_tag = (tag or "").strip()
-        
-        vector_match_groups = [
-            self.store.search(query_vector, top_k=top_k, tag=normalized_tag or None)
-            for query_vector in query_vectors
-        ]
+        with self.coordinator.acquire(
+            "embeddings",
+            workload="query",
+            timeout=self.settings.model_request_timeout,
+        ):
+            self._ensure_models(("embeddings",))
+            try:
+                query_vectors = self.client.embed_texts(retrieval_queries)
+                vector_match_groups = [
+                    self.store.search(
+                        query_vector,
+                        top_k=top_k,
+                        tag=normalized_tag or None,
+                    )
+                    for query_vector in query_vectors
+                ]
+            finally:
+                # Embeddings se descarga antes de solicitar el lease de chat.
+                self._stop_models(("embeddings",))
+                self._release_model_memory()
 
         if self.settings.hybrid_search_enabled:
             bm25_top_k = top_k * self.settings.bm25_top_k_multiplier
@@ -500,18 +585,29 @@ class RagPipeline:
     ) -> dict[str, Any]:
         """Responde una pregunta usando retrieval + generación no streaming."""
         generation_inputs = self._prepare_generation_inputs(question, top_k=top_k, messages=messages, tag=tag)
-        generation = self.client.generate_answer(
-            question,
-            generation_inputs["context_blocks"],
-            messages=messages,
-            enable_reasoning=enable_reasoning,
-        )
-        citations = self._select_used_citations(
-            question=question,
-            answer=generation["answer"],
-            generation_inputs=generation_inputs,
-            messages=messages,
-        )
+        with self.coordinator.acquire(
+            "chat",
+            workload="query",
+            timeout=self.settings.model_request_timeout,
+        ):
+            self._ensure_models(("chat",))
+            try:
+                generation = self.client.generate_answer(
+                    question,
+                    generation_inputs["context_blocks"],
+                    messages=messages,
+                    enable_reasoning=enable_reasoning,
+                )
+                # La auditoría comparte exactamente la misma carga de chat.
+                citations = self._select_used_citations(
+                    question=question,
+                    answer=generation["answer"],
+                    generation_inputs=generation_inputs,
+                    messages=messages,
+                )
+            finally:
+                if self.supervisor is not None:
+                    self.supervisor.schedule_idle_stop("chat")
         return {
             "answer": generation["answer"],
             "reasoning": generation["reasoning"],
@@ -529,25 +625,74 @@ class RagPipeline:
     ) -> dict[str, Any]:
         """Responde una pregunta en streaming."""
         generation_inputs = self._prepare_generation_inputs(question, top_k=top_k, messages=messages, tag=tag)
-
-        return {
-            "answer_stream": self.client.stream_answer(
+        chat_lease = self.coordinator.acquire(
+            "chat",
+            workload="query",
+            timeout=self.settings.model_request_timeout,
+        )
+        try:
+            self._ensure_models(("chat",))
+            primary_stream = self.client.stream_answer(
                 question,
                 generation_inputs["context_blocks"],
                 messages=messages,
                 enable_reasoning=enable_reasoning,
-            ),
-            "fallback_stream": lambda: self.client.stream_answer(
+            )
+        except BaseException:
+            chat_lease.release()
+            raise
+
+        cleanup_lock = threading.Lock()
+        cleaned = False
+
+        def cleanup() -> None:
+            nonlocal cleaned
+            with cleanup_lock:
+                if cleaned:
+                    return
+                cleaned = True
+                try:
+                    if self.supervisor is not None:
+                        self.supervisor.schedule_idle_stop("chat")
+                finally:
+                    chat_lease.release()
+
+        def guarded_stream(stream):
+            completed = False
+            try:
+                for event in stream:
+                    yield event
+                completed = True
+            finally:
+                # En flujo normal se conserva el lease hasta auditar las citas.
+                # Un cierre/una excepción prematuros lo libera inmediatamente.
+                if not completed:
+                    cleanup()
+
+        def fallback_stream():
+            stream = self.client.stream_answer(
                 question,
                 generation_inputs["context_blocks"],
                 messages=messages,
                 enable_reasoning=False,
-            ),
-            "resolve_citations": lambda answer: self._select_used_citations(
-                question=question,
-                answer=answer,
-                generation_inputs=generation_inputs,
-                messages=messages,
-            ),
+            )
+            return guarded_stream(stream)
+
+        def resolve_citations(answer: str) -> list[dict[str, Any]]:
+            try:
+                return self._select_used_citations(
+                    question=question,
+                    answer=answer,
+                    generation_inputs=generation_inputs,
+                    messages=messages,
+                )
+            finally:
+                cleanup()
+
+        return {
+            "answer_stream": guarded_stream(primary_stream),
+            "fallback_stream": fallback_stream,
+            "resolve_citations": resolve_citations,
+            "close": cleanup,
             "matches": generation_inputs["matches"],
         }

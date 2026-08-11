@@ -1,4 +1,6 @@
 fastapi>=0.115.0
+httpx>=0.27.0,<1.0.0
+huggingface-hub>=0.27.0,<2.0.0
 # PyTorch/torchvision se instalan exclusivamente en setup.ps1, donde se elige
 # de forma explícita la distribución CPU o CUDA antes de instalar este archivo.
 lancedb>=0.17.0

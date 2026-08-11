@@ -8,6 +8,8 @@
 data/pdfs/*
 !data/pdfs/.gitkeep
 data/models/*
+models/
+data/logs/models/
 
 # Base vectorial local generada
 data/lancedb/

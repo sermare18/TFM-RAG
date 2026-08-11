@@ -18,7 +18,6 @@ from __future__ import annotations
 import html as html_lib
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -319,49 +318,6 @@ def _require_marker_2() -> str:
     return installed_version
 
 
-def _install_surya_windows_cleanup_workaround() -> None:
-    """Evito que el cierre de llama.cpp de Surya interrumpa mi propio proceso en Windows.
-
-    Surya 0.22.1 registra un callback `atexit` que usa `os.kill()` y después
-    sondea el PID. En Windows ese flujo puede generar un `KeyboardInterrupt`
-    en el proceso que ejecuta el indexado. Sustituyo solo esa función interna
-    por `taskkill /F`, dirigido al PID exacto que Surya acaba de crear.
-    """
-    if os.name != "nt":
-        return
-
-    from surya.inference.backends import spawn as surya_spawn
-
-    def stop_process_without_console_signal(pid: int, name: str) -> None:
-        try:
-            completed = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if completed.returncode == 0:
-                surya_spawn.logger.info(f"Stopped {name} (pid {pid})")
-                return
-
-            # Considero inocuo que el servidor ya haya terminado antes del callback.
-            output = (completed.stderr or completed.stdout or b"").decode(
-                errors="replace"
-            ).strip()
-            if output:
-                surya_spawn.logger.debug(
-                    f"No tuve que detener {name} (pid {pid}): {output}"
-                )
-        except Exception as exc:
-            # No dejo que un fallo de limpieza oculte un indexado ya completado.
-            surya_spawn.logger.warning(
-                f"No pude cerrar {name} (pid {pid}) durante la limpieza: {exc}"
-            )
-
-    surya_spawn._stop_process = stop_process_without_console_signal
-
-
 def create_marker_converter(settings: Settings) -> Any:
     """Inicializo Marker 2 una vez y reutilizo sus modelos entre documentos.
 
@@ -371,13 +327,11 @@ def create_marker_converter(settings: Settings) -> Any:
     profile = resolve_marker_profile(settings)
 
     if profile.use_llm:
-        # La conexión VLM local se incorpora en la fase siguiente. Fallo antes
-        # de comprobar Marker o crear modelos para que ConfigParser no pueda
-        # seleccionar por defecto el servicio Gemini.
-        raise RuntimeError(
-            f"El perfil {profile.name} requiere un endpoint VLM local válido; "
-            "su conexión se implementará en una fase posterior. No se usará Gemini."
-        )
+        # Se valida antes de crear Marker: ConfigParser nunca puede seleccionar
+        # Gemini ni otro proveedor externo como servicio implícito.
+        from rag_cliente.marker_llm import validate_marker_local_only
+
+        validate_marker_local_only(settings)
 
     _require_marker_2()
     os.environ["TORCH_DEVICE"] = profile.torch_device
@@ -387,14 +341,31 @@ def create_marker_converter(settings: Settings) -> Any:
     else:
         os.environ["SURYA_INFERENCE_BACKEND"] = profile.inference_backend
 
-    llama_cpp_binary = settings.marker_llama_cpp_binary.strip()
+    llama_cpp_binary = settings.llama_cpp_binary.strip()
     if profile.inference_backend == "llamacpp":
         resolved_binary = Path(llama_cpp_binary).expanduser().resolve()
         if not resolved_binary.is_file():
             raise RuntimeError(
-                f"MARKER_LLAMA_CPP_BINARY no existe o no es un archivo: {resolved_binary}"
+                f"LLAMA_CPP_BINARY no existe o no es un archivo: {resolved_binary}"
             )
         os.environ["LLAMA_CPP_BINARY"] = str(resolved_binary)
+        os.environ["SURYA_GGUF_LOCAL_MODEL_PATH"] = str(
+            Path(settings.surya_gguf_path).expanduser().resolve()
+            if settings.surya_gguf_path.strip()
+            else (settings.models_path / "surya-ocr-2" / "surya-2.gguf").resolve()
+        )
+        os.environ["SURYA_GGUF_LOCAL_MMPROJ_PATH"] = str(
+            Path(settings.surya_mmproj_path).expanduser().resolve()
+            if settings.surya_mmproj_path.strip()
+            else (settings.models_path / "surya-ocr-2" / "surya-2-mmproj.gguf").resolve()
+        )
+        # SURYA_INFERENCE_URL fuerza a Surya a adjuntarse al servidor local ya
+        # administrado; así no crea PIDs ni descarga GGUF por su cuenta.
+        os.environ["SURYA_INFERENCE_URL"] = settings.surya_base_url
+        os.environ["SURYA_INFERENCE_PARALLEL"] = "1"
+        os.environ["SURYA_INFERENCE_CTX_SIZE"] = str(settings.model_context_size)
+        os.environ["SURYA_INFERENCE_STARTUP_TIMEOUT"] = str(settings.model_start_timeout)
+        os.environ["SURYA_INFERENCE_TIMEOUT_SECONDS"] = str(settings.model_request_timeout)
 
     if profile.torch_device == "cuda":
         try:
@@ -420,9 +391,6 @@ def create_marker_converter(settings: Settings) -> Any:
             "Ejecuta setup.ps1 para instalar marker-pdf[full]."
         ) from exc
 
-    # Instalo el ajuste antes de que Surya registre su callback de salida.
-    _install_surya_windows_cleanup_workaround()
-
     try:
         config_parser = ConfigParser(_build_marker_config(settings, profile))
         renderer = (
@@ -430,22 +398,36 @@ def create_marker_converter(settings: Settings) -> Any:
             if settings.marker_markdown_compatibility
             else "rag_cliente.pdf_loader.MarkerJSONRendererWithOcrMetadata"
         )
-        return PdfConverter(
+        llm_service = None
+        if profile.use_llm:
+            from rag_cliente.marker_llm import BudgetedMarkerOpenAIService
+
+            llm_service = BudgetedMarkerOpenAIService(settings)
+
+        converter = PdfConverter(
             config=config_parser.generate_config_dict(),
             artifact_dict=create_model_dict(
                 inference_backend=profile.inference_backend
             ),
             processor_list=config_parser.get_processors(),
             renderer=renderer,
-            llm_service=None,
+            llm_service=llm_service,
         )
+        if llm_service is not None:
+            setattr(converter, "_rag_llm_service", llm_service)
+        return converter
     except Exception as exc:
         raise RuntimeError(f"No se pudo inicializar Marker: {exc}") from exc
 
 
 def _render_with_marker(path: Path, marker_converter: Any) -> tuple[Any, dict[str, Any]]:
     """Ejecuta el converter recibido y conserva su salida oficial completa."""
-    rendered = marker_converter(str(path))
+    llm_service = getattr(marker_converter, "_rag_llm_service", None)
+    if llm_service is None:
+        rendered = marker_converter(str(path))
+    else:
+        with llm_service.document_budget(str(path.resolve())):
+            rendered = marker_converter(str(path))
     metadata = getattr(rendered, "metadata", {})
     if isinstance(rendered, dict):
         metadata = rendered.get("metadata", metadata)
@@ -512,11 +494,14 @@ def _text_from_marker_block(block: dict[str, Any]) -> str:
             " ",
             html_lib.unescape(without_tags),
         )
-        return _normalize_text(normalized_html_text)
+        normalized_html_text = _normalize_text(normalized_html_text)
+        if normalized_html_text:
+            return normalized_html_text
 
+    children = block.get("children")
     child_texts = [
         _text_from_marker_block(child)
-        for child in block.get("children", [])
+        for child in (children if isinstance(children, list) else [])
         if isinstance(child, dict)
     ]
     return _normalize_text("\n\n".join(text for text in child_texts if text))
@@ -695,6 +680,10 @@ def _marker_document_pages(
     try:
         rendered, metadata = _render_with_marker(path, marker_converter)
     except Exception as exc:
+        from rag_cliente.marker_llm import MarkerLLMError
+
+        if isinstance(exc, MarkerLLMError):
+            raise
         raise RuntimeError(f"Marker falló procesando '{path.name}': {exc}") from exc
 
     marker_ocr_usage = _extract_marker_ocr_usage_by_page(metadata)
@@ -917,6 +906,10 @@ def load_documents_from_directory(
             else:
                 continue
         except Exception as exc:
+            from rag_cliente.marker_llm import MarkerLLMError
+
+            if isinstance(exc, MarkerLLMError):
+                raise
             _emit(progress_callback, f"AVISO: no se pudo procesar {display_path}: {exc}")
             continue
 

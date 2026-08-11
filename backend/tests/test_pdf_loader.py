@@ -4,10 +4,9 @@ import tempfile
 import types
 import unittest
 import importlib
-import os
 import sys
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 # El otro módulo de pruebas instala dobles ligeros para FastAPI. Yo retiro solo
 # el doble del loader para comprobar aquí la implementación real de Marker.
@@ -21,7 +20,6 @@ from rag_cliente.pdf_loader import (
     _build_marker_config,
     _collect_marker_page_extraction_details,
     _extract_marker_structured_chunks,
-    _install_surya_windows_cleanup_workaround,
     _require_marker_2,
     _split_marker_markdown_by_page,
     create_marker_converter,
@@ -34,7 +32,7 @@ class Marker2ConfigurationTests(unittest.TestCase):
         expected = {
             "cpu-digital": ("fast", True, False, "cpu", None),
             "cpu-quality": ("fast", False, True, "cpu", "llamacpp"),
-            "gpu-quality": ("balanced", False, True, "cuda", None),
+            "gpu-quality": ("balanced", False, True, "cuda", "llamacpp"),
         }
 
         for profile_name, values in expected.items():
@@ -122,41 +120,16 @@ class Marker2ConfigurationTests(unittest.TestCase):
                 _require_marker_2()
 
     def test_quality_profile_fails_before_marker_without_local_vlm_endpoint(self) -> None:
-        settings = Settings(marker_profile="cpu-quality")
+        settings = Settings(
+            marker_profile="cpu-quality",
+            marker_openai_base_url="",
+        )
 
         with patch("rag_cliente.pdf_loader._require_marker_2") as marker_version:
-            with self.assertRaisesRegex(RuntimeError, "endpoint VLM local válido"):
+            with self.assertRaisesRegex(RuntimeError, "local_llm_endpoint_required"):
                 create_marker_converter(settings)
 
         marker_version.assert_not_called()
-
-    @unittest.skipUnless(os.name == "nt", "Este ajuste solo se aplica en Windows")
-    def test_windows_cleanup_targets_only_the_spawned_server_pid(self) -> None:
-        surya_module = types.ModuleType("surya")
-        inference_module = types.ModuleType("surya.inference")
-        backends_module = types.ModuleType("surya.inference.backends")
-        spawn_module = types.ModuleType("surya.inference.backends.spawn")
-        spawn_module._stop_process = lambda pid, name: None
-        spawn_module.logger = Mock()
-        backends_module.spawn = spawn_module
-        completed = types.SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
-
-        fake_modules = {
-            "surya": surya_module,
-            "surya.inference": inference_module,
-            "surya.inference.backends": backends_module,
-            "surya.inference.backends.spawn": spawn_module,
-        }
-        with (
-            patch.dict(sys.modules, fake_modules),
-            patch("rag_cliente.pdf_loader.subprocess.run", return_value=completed) as taskkill,
-        ):
-            _install_surya_windows_cleanup_workaround()
-            spawn_module._stop_process(12345, "llamacpp")
-
-        # Compruebo que cierro únicamente el árbol del PID creado por Surya.
-        self.assertEqual(taskkill.call_args.args[0][:4], ["taskkill", "/PID", "12345", "/T"])
-        self.assertIn("/F", taskkill.call_args.args[0])
 
     def test_setup_accepts_auto_cpu_cuda_and_keeps_editable_install_dependency_free(self) -> None:
         setup_source = (Path(__file__).parents[1] / "setup.ps1").read_text(encoding="utf-8")
@@ -166,6 +139,31 @@ class Marker2ConfigurationTests(unittest.TestCase):
 
 
 class Marker2MetadataTests(unittest.TestCase):
+    def test_json_page_content_refs_fall_back_to_child_html(self) -> None:
+        rendered = {
+            "block_type": "Document",
+            "metadata": {},
+            "children": [
+                {
+                    "block_type": "Page",
+                    "id": "/page/0/Page/0",
+                    "html": '<content-ref src="/page/0/Text/0"></content-ref>',
+                    "children": [
+                        {
+                            "block_type": "Text",
+                            "id": "/page/0/Text/0",
+                            "html": "<p>Texto real del PDF</p>",
+                            "children": None,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        chunks = _extract_marker_structured_chunks(rendered)
+
+        self.assertEqual(chunks[0]["text"], "Texto real del PDF")
+
     def test_table_visual_fallback_marks_page_as_ocr_used(self) -> None:
         page = types.SimpleNamespace(
             text_extraction_method="pdftext",

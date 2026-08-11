@@ -22,6 +22,8 @@ if /I "%COMMAND%"=="ask" goto :ask
 if /I "%COMMAND%"=="viewer" goto :viewer
 if /I "%COMMAND%"=="test" goto :test
 if /I "%COMMAND%"=="gpu" goto :gpu
+if /I "%COMMAND%"=="doctor" goto :doctor
+if /I "%COMMAND%"=="models" goto :models
 goto :help
 
 :api
@@ -61,6 +63,18 @@ exit /b %ERRORLEVEL%
 conda run --no-capture-output -n "%ENV_NAME%" python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA disponible:', torch.cuda.is_available()); print('CUDA runtime:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NINGUNA')"
 exit /b %ERRORLEVEL%
 
+:doctor
+conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli doctor
+exit /b %ERRORLEVEL%
+
+:models
+if "%~2"=="" (
+    echo Uso: rag.bat models ^<plan^|download^|check^> [cpu^|gpu]
+    exit /b 1
+)
+conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli models %2 %3 %4 %5 %6 %7 %8 %9
+exit /b %ERRORLEVEL%
+
 :help
 echo Uso: rag.bat ^<comando^> [argumento]
 echo.
@@ -70,4 +84,9 @@ echo   ask [opciones]     Consulta el RAG; admite todas las opciones del CLI
 echo   viewer             Abre el visor de LanceDB
 echo   test               Ejecuta los tests
 echo   gpu                Comprueba PyTorch y CUDA
+echo   doctor             Valida hardware, llama.cpp, disco y configuracion sin arrancar modelos
+echo   models plan cpu    Muestra el plan local de modelos CPU sin descargar
+echo   models plan gpu    Muestra el plan local de modelos GPU sin descargar
+echo   models download cpu/gpu  Descarga solo al solicitarlo explicitamente
+echo   models check       Valida GGUF, mmproj y rutas sin cargar modelos
 exit /b 0
