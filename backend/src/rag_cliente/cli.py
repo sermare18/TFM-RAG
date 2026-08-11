@@ -17,6 +17,13 @@ from rag_cliente.model_manifest import check_models, download_models, plan_model
 from rag_cliente.pipeline import RagPipeline
 
 
+def run_smoke_parser(pdf_path: Path, settings):
+    """Importación perezosa para no cargar el parser en comandos de chat/API."""
+    from rag_cliente.smoke_parser import run_smoke_parser as run
+
+    return run(pdf_path, settings)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construye el parser principal y sus subcomandos."""
     parser = argparse.ArgumentParser(description="Local RAG CLI for document indexing and Q&A.")
@@ -58,6 +65,22 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("profile", choices=("cpu", "gpu"))
     check_parser = models_subparsers.add_parser("check")
     check_parser.add_argument("--profile", choices=("cpu", "gpu"), default=None)
+
+    smoke_parser = subparsers.add_parser(
+        "smoke-parser",
+        help="Manually parse a bounded PDF page range and emit structured JSON.",
+    )
+    smoke_parser.add_argument("pdf", type=Path, help="PDF file to parse.")
+    smoke_parser.add_argument(
+        "--profile",
+        required=True,
+        choices=("cpu-digital", "cpu-quality", "gpu-quality", "auto"),
+    )
+    smoke_parser.add_argument(
+        "--pages",
+        required=True,
+        help="Marker 0-based page range, for example 0-2 or 0,3,5-6.",
+    )
 
     return parser
 
@@ -128,6 +151,17 @@ def main() -> None:
             if not all(report["valid"] for report in reports):
                 raise SystemExit(1)
             return
+
+    if args.command == "smoke-parser":
+        smoke_settings = settings.model_copy(
+            update={
+                "marker_profile": args.profile,
+                "marker_page_range": args.pages,
+            }
+        )
+        report = run_smoke_parser(args.pdf, smoke_settings)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
 
     settings.lancedb_path.mkdir(parents=True, exist_ok=True)
     pipeline = RagPipeline(settings)

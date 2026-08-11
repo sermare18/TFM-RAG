@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import json
-import base64
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from io import BytesIO
 from typing import Any, Callable, Iterator
 
 import openai
 import httpx
+from marker.services.openai import OpenAIService
 
 APIConnectionError = getattr(openai, "APIConnectionError", type("APIConnectionError", (Exception,), {}))
 APITimeoutError = getattr(openai, "APITimeoutError", type("APITimeoutError", (Exception,), {}))
 RateLimitError = getattr(openai, "RateLimitError", type("RateLimitError", (Exception,), {}))
+BadRequestError = getattr(openai, "BadRequestError", type("BadRequestError", (Exception,), {}))
 
 from rag_cliente.config import Settings
 from rag_cliente.local_endpoints import is_local_model_endpoint
@@ -92,16 +92,29 @@ class MarkerBudgetState:
     completion_tokens: int = 0
 
 
-class BudgetedMarkerOpenAIService:
-    """Wrapper local que conserva mensajes/esquema y limita toda repetición."""
+class BudgetedMarkerOpenAIService(OpenAIService):
+    """`OpenAIService` oficial limitado al VLM local y con presupuestos."""
 
     def __init__(
         self,
-        settings: Settings,
+        config: Any = None,
         *,
+        settings: Settings | None = None,
         client_factory: Callable[[], Any] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        # Compatibilidad con las llamadas directas de la fase 2:
+        # BudgetedMarkerOpenAIService(Settings(...)). Marker, en cambio, crea
+        # el servicio desde su ruta pública y entrega el diccionario config.
+        if isinstance(config, Settings) and settings is None:
+            settings = config
+            config = None
+        marker_config = dict(config or {})
+        service_overrides = marker_config.get("rag_marker_service_settings", {})
+        if not isinstance(service_overrides, dict):
+            service_overrides = {}
+        settings = settings or Settings(**service_overrides)
+
         endpoint = validate_marker_local_only(settings)
         self.settings = settings
         self._client_factory = client_factory
@@ -110,15 +123,22 @@ class BudgetedMarkerOpenAIService:
         self._state: MarkerBudgetState | None = None
         self.last_report: dict[str, Any] | None = None
 
-        # La clave es una constante local sin valor externo. No se consulta
-        # OPENAI_API_KEY ni ninguna credencial de proveedor.
-        self.openai_base_url = endpoint
-        self.openai_model = settings.marker_openai_model
-        self.openai_api_key = "local-only"
-        self.openai_image_format = "png"
-        self.timeout = int(settings.marker_llm_request_timeout)
-        self.max_retries = settings.marker_llm_max_retries
-        self.max_output_tokens = settings.marker_llm_max_tokens_per_request
+        # OpenAIService conserva el formato multimodal, los prompts y el
+        # response_schema que entregan los procesadores oficiales de Marker.
+        # La clave es una constante local y nunca se consulta una credencial de
+        # proveedor externo.
+        marker_config.update(
+            {
+                "openai_base_url": endpoint,
+                "openai_model": settings.marker_openai_model,
+                "openai_api_key": "local-only",
+                "openai_image_format": "png",
+                "timeout": int(settings.marker_llm_request_timeout),
+                "max_retries": settings.marker_llm_max_retries,
+                "max_output_tokens": settings.marker_llm_max_tokens_per_request,
+            }
+        )
+        super().__init__(config=marker_config)
 
     def get_client(self):
         if self._client_factory is not None:
@@ -129,30 +149,11 @@ class BudgetedMarkerOpenAIService:
             timeout=self.settings.marker_llm_request_timeout,
             # El wrapper controla el único reintento; el SDK no añade otros.
             max_retries=0,
+            http_client=httpx.Client(
+                timeout=self.settings.marker_llm_request_timeout,
+                trust_env=False,
+            ),
         )
-
-    def process_images(self, images: Any) -> list[dict]:
-        if not isinstance(images, list):
-            images = [images]
-        encoded = []
-        for image in images:
-            image_bytes = BytesIO()
-            image.save(image_bytes, format=self.openai_image_format)
-            payload = base64.b64encode(image_bytes.getvalue()).decode("utf-8")
-            encoded.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/{self.openai_image_format};base64,{payload}",
-                    },
-                }
-            )
-        return encoded
-
-    def format_image_for_llm(self, image: Any) -> list[dict]:
-        if not image:
-            return []
-        return self.process_images(image)
 
     @contextmanager
     def document_budget(self, document_id: str) -> Iterator["BudgetedMarkerOpenAIService"]:
@@ -295,6 +296,21 @@ class BudgetedMarkerOpenAIService:
                     raise MarkerLLMError(
                         "local_llm_request_failed",
                         "Falló la petición al VLM local tras el reintento permitido",
+                        attempts=attempt,
+                        reason=type(exc).__name__,
+                    ) from exc
+                except BadRequestError as exc:
+                    if len(image_data) > 1:
+                        raise MarkerLLMError(
+                            "local_vlm_multiple_images_unsupported",
+                            "El endpoint VLM local rechazó una petición con múltiples imágenes",
+                            attempts=attempt,
+                            image_count=len(image_data),
+                            reason=type(exc).__name__,
+                        ) from exc
+                    raise MarkerLLMError(
+                        "local_llm_request_failed",
+                        "El endpoint VLM local rechazó la petición estructurada",
                         attempts=attempt,
                         reason=type(exc).__name__,
                     ) from exc

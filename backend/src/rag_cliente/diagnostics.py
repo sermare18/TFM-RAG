@@ -7,6 +7,7 @@ from pathlib import Path
 
 from rag_cliente.config import Settings, resolve_marker_profile
 from rag_cliente.local_endpoints import is_local_model_endpoint
+from rag_cliente.marker_capabilities import marker_capabilities, marker_version_status
 from rag_cliente.model_manifest import check_models
 from rag_cliente.model_supervisor import detect_hardware
 
@@ -27,6 +28,7 @@ def run_doctor(settings: Settings) -> dict:
     model_profile = "gpu" if profile.name == "gpu-quality" else "cpu"
     required_disk_gib = 20 if model_profile == "gpu" else 12
     model_reports = check_models(settings, model_profile)
+    marker_status = marker_version_status()
     endpoints = {
         "surya": settings.surya_base_url,
         "vlm": settings.marker_openai_base_url,
@@ -39,6 +41,18 @@ def run_doctor(settings: Settings) -> dict:
             "name": "llama_cpp_binary",
             "ok": binary.is_file(),
             "detail": str(binary),
+        },
+        {
+            "name": "marker_installed",
+            "ok": marker_status["installed"] is not None,
+            "required": settings.marker_enabled,
+            "detail": marker_status["detail"],
+        },
+        {
+            "name": "marker_validated_version",
+            "ok": marker_status["matches_validated"],
+            "required": False,
+            "detail": marker_status["detail"],
         },
         {
             "name": "models_dir",
@@ -84,13 +98,20 @@ def run_doctor(settings: Settings) -> dict:
         },
     ]
     return {
-        "ok": all(check["ok"] for check in checks),
+        "ok": all(
+            check["ok"] or not check.get("required", True)
+            for check in checks
+        ),
         "hardware": {
             "cpu_threads": hardware.cpu_threads,
             "nvidia_available": hardware.nvidia_available,
             "nvidia_gpus": list(hardware.nvidia_gpus),
         },
         "profile": profile.name,
+        "capabilities": marker_capabilities(),
+        "warnings": (
+            [] if marker_status["matches_validated"] else [marker_status["detail"]]
+        ),
         "supervision_enabled": settings.model_supervision_enabled,
         "checks": checks,
         "models": model_reports,

@@ -19,7 +19,6 @@ import html as html_lib
 import os
 import re
 from dataclasses import dataclass, field
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,6 +26,10 @@ import fitz
 from docx import Document
 
 from rag_cliente.config import ResolvedMarkerProfile, Settings, resolve_marker_profile
+from rag_cliente.marker_capabilities import (
+    marker_capabilities,
+    require_marker_installed_and_warn_if_unvalidated,
+)
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 MARKER_DOCUMENT_SUFFIXES = {
@@ -43,6 +46,92 @@ ProgressCallback = Callable[[str], None]
 _MARKER_PAGE_SEPARATOR_RE = re.compile(
     r"(?:^|\n+)(?:\{)?(\d+)(?:\})?-{20,}[ \t]*(?:\n+|$)"
 )
+
+# Pipeline estándar de Marker 2.0.0 sin procesadores LLM ajenos a tablas. Los
+# perfiles quality insertan los dos procesadores oficiales inmediatamente
+# después de TableProcessor. cpu-digital conserva el mismo pipeline no LLM.
+MARKER_STANDARD_NON_LLM_PROCESSORS: tuple[str, ...] = (
+    "marker.processors.block_relabel.BlockRelabelProcessor",
+    "marker.processors.line_merge.LineMergeProcessor",
+    "marker.processors.blockquote.BlockquoteProcessor",
+    "marker.processors.code.CodeProcessor",
+    "marker.processors.document_toc.DocumentTOCProcessor",
+    "marker.processors.equation.EquationProcessor",
+    "marker.processors.footnote.FootnoteProcessor",
+    "marker.processors.ignoretext.IgnoreTextProcessor",
+    "marker.processors.line_numbers.LineNumbersProcessor",
+    "marker.processors.list.ListProcessor",
+    "marker.processors.page_header.PageHeaderProcessor",
+    "marker.processors.marginalia.MarginaliaProcessor",
+    "marker.processors.sectionheader.SectionHeaderProcessor",
+    "marker.processors.table.TableProcessor",
+    "marker.processors.text.TextProcessor",
+    "marker.processors.reference.ReferenceProcessor",
+    "marker.processors.blank_page.BlankPageProcessor",
+    "marker.processors.debug.DebugProcessor",
+)
+MARKER_OFFICIAL_TABLE_LLM_PROCESSORS: tuple[str, ...] = (
+    "marker.processors.llm.llm_table.LLMTableProcessor",
+    "marker.processors.llm.llm_table_merge.LLMTableMergeProcessor",
+)
+
+
+@dataclass(slots=True)
+class DocumentElement:
+    """Elemento estructurado normalizado desde el JSON oficial de Marker."""
+
+    id: str
+    kind: str
+    html: str
+    text: str
+    page_start: int
+    page_end: int
+    source_pages: list[int] = field(default_factory=list)
+    source_block_ids: list[str] = field(default_factory=list)
+    source_spans: list[dict[str, Any]] = field(default_factory=list)
+    section_hierarchy: dict[str, Any] = field(default_factory=dict)
+    polygon: list[list[float]] = field(default_factory=list)
+    confidence: float | None = None
+    children: list["DocumentElement"] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "html": self.html,
+            "text": self.text,
+            "page_start": self.page_start,
+            "page_end": self.page_end,
+            "source_pages": list(self.source_pages),
+            "source_block_ids": list(self.source_block_ids),
+            "source_spans": [dict(span) for span in self.source_spans],
+            "section_hierarchy": dict(self.section_hierarchy),
+            "polygon": [list(point) for point in self.polygon],
+            "confidence": self.confidence,
+            "children": [child.as_dict() for child in self.children],
+        }
+
+
+@dataclass(slots=True)
+class ParsedDocument:
+    """Resultado primario del parser, independiente del chunking posterior."""
+
+    id: str
+    source: str
+    source_path: str
+    source_type: str
+    elements: list[DocumentElement]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source": self.source,
+            "source_path": self.source_path,
+            "source_type": self.source_type,
+            "elements": [element.as_dict() for element in self.elements],
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(slots=True)
@@ -78,7 +167,21 @@ class PageDocument:
     polygon: list[list[float]] = field(default_factory=list)
     children: list[dict[str, Any]] = field(default_factory=list)
     section_hierarchy: dict[str, Any] = field(default_factory=dict)
+    page_start: int | None = None
+    page_end: int | None = None
+    source_pages: list[int] = field(default_factory=list)
+    source_block_ids: list[str] = field(default_factory=list)
+    source_spans: list[dict[str, Any]] = field(default_factory=list)
+    confidence: float | None = None
     extraction_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.page_start is None:
+            self.page_start = self.page_number
+        if self.page_end is None:
+            self.page_end = self.page_number
+        if not self.source_pages:
+            self.source_pages = list(range(self.page_start, self.page_end + 1))
 
 
 def _emit(progress_callback: ProgressCallback | None, message: str) -> None:
@@ -160,6 +263,13 @@ def _collect_marker_page_extraction_details(page: Any, document: Any) -> dict[st
     }
 
 
+def _metadata_with_marker_capabilities(metadata: Any) -> dict[str, Any]:
+    """Añade el contrato de capacidad a los metadatos del documento."""
+    enriched = dict(metadata or {}) if isinstance(metadata, dict) else {}
+    enriched["capabilities"] = marker_capabilities()
+    return enriched
+
+
 class MarkerMarkdownRendererWithOcrMetadata:
     """Enriquezco el renderer Markdown de Marker con metadatos OCR por página.
 
@@ -175,7 +285,9 @@ class MarkerMarkdownRendererWithOcrMetadata:
 
     def __call__(self, document: Any) -> Any:
         rendered = self._renderer(document)
-        metadata = dict(getattr(rendered, "metadata", {}) or {})
+        metadata = _metadata_with_marker_capabilities(
+            getattr(rendered, "metadata", {})
+        )
         page_stats_by_id: dict[int, dict[str, Any]] = {}
 
         for page_stat in metadata.get("page_stats", []) or []:
@@ -219,7 +331,9 @@ class MarkerJSONRendererWithOcrMetadata:
 
     def __call__(self, document: Any) -> Any:
         rendered = self._renderer(document)
-        metadata = dict(getattr(rendered, "metadata", {}) or {})
+        metadata = _metadata_with_marker_capabilities(
+            getattr(rendered, "metadata", {})
+        )
         page_stats_by_id: dict[int, dict[str, Any]] = {}
 
         for page_stat in metadata.get("page_stats", []) or []:
@@ -271,6 +385,17 @@ def _load_native_pdf_pages(pdf_path: Path) -> list[PageDocument]:
     return pages
 
 
+def _official_marker_processor_paths(
+    profile: ResolvedMarkerProfile,
+) -> tuple[str, ...]:
+    """Conserva el pipeline estándar y limita LLM a las tablas oficiales."""
+    processors = list(MARKER_STANDARD_NON_LLM_PROCESSORS)
+    if profile.use_llm:
+        table_index = processors.index("marker.processors.table.TableProcessor") + 1
+        processors[table_index:table_index] = MARKER_OFFICIAL_TABLE_LLM_PROCESSORS
+    return tuple(processors)
+
+
 def _build_marker_config(
     settings: Settings,
     profile: ResolvedMarkerProfile | None = None,
@@ -285,6 +410,27 @@ def _build_marker_config(
         "disable_ocr": resolved_profile.disable_ocr,
         "use_llm": resolved_profile.use_llm,
         "min_recon_score": settings.marker_table_min_recon_score,
+        "max_concurrency": 1,
+        "processors": ",".join(_official_marker_processor_paths(resolved_profile)),
+        # El servicio se instancia desde la ruta de clase pública que espera
+        # PdfConverter. Este bloque transporta los Settings ya resueltos sin
+        # recurrir a variables de proveedor ni a un fallback implícito.
+        "rag_marker_service_settings": {
+            "marker_openai_base_url": settings.marker_openai_base_url,
+            "marker_openai_model": settings.marker_openai_model,
+            "surya_base_url": settings.surya_base_url,
+            "local_model_hosts": settings.local_model_hosts,
+            "marker_llm_max_requests": settings.marker_llm_max_requests,
+            "marker_llm_max_tokens_per_request": settings.marker_llm_max_tokens_per_request,
+            "marker_llm_max_generated_tokens_per_document": (
+                settings.marker_llm_max_generated_tokens_per_document
+            ),
+            "marker_llm_request_timeout": settings.marker_llm_request_timeout,
+            "marker_llm_job_timeout": settings.marker_llm_job_timeout,
+            "marker_llm_max_retries": settings.marker_llm_max_retries,
+            "marker_llm_fallback_to_base": settings.marker_llm_fallback_to_base,
+            "model_health_connect_timeout": settings.model_health_connect_timeout,
+        },
     }
 
     if settings.marker_strip_existing_ocr:
@@ -297,25 +443,8 @@ def _build_marker_config(
 
 
 def _require_marker_2() -> str:
-    """Compruebo que el entorno ejecuta Marker 2 antes de crear sus modelos."""
-    try:
-        installed_version = version("marker-pdf")
-    except PackageNotFoundError as exc:
-        raise RuntimeError(
-            "Marker no está instalado. Ejecuta setup.ps1 para instalar marker-pdf 2.x."
-        ) from exc
-
-    try:
-        major_version = int(installed_version.split(".", 1)[0])
-    except ValueError as exc:
-        raise RuntimeError(f"No pude interpretar la versión de Marker: {installed_version}") from exc
-
-    if major_version != 2:
-        raise RuntimeError(
-            f"Este proyecto requiere marker-pdf 2.x y encontré {installed_version}. "
-            "Ejecuta setup.ps1 para sincronizar el entorno."
-        )
-    return installed_version
+    """Exige Marker para parsear y avisa si no es la versión validada."""
+    return require_marker_installed_and_warn_if_unvalidated()
 
 
 def create_marker_converter(settings: Settings) -> Any:
@@ -398,11 +527,11 @@ def create_marker_converter(settings: Settings) -> Any:
             if settings.marker_markdown_compatibility
             else "rag_cliente.pdf_loader.MarkerJSONRendererWithOcrMetadata"
         )
-        llm_service = None
-        if profile.use_llm:
-            from rag_cliente.marker_llm import BudgetedMarkerOpenAIService
-
-            llm_service = BudgetedMarkerOpenAIService(settings)
+        llm_service_path = (
+            "rag_cliente.marker_llm.BudgetedMarkerOpenAIService"
+            if profile.use_llm
+            else None
+        )
 
         converter = PdfConverter(
             config=config_parser.generate_config_dict(),
@@ -411,10 +540,13 @@ def create_marker_converter(settings: Settings) -> Any:
             ),
             processor_list=config_parser.get_processors(),
             renderer=renderer,
-            llm_service=llm_service,
+            llm_service=llm_service_path,
         )
-        if llm_service is not None:
-            setattr(converter, "_rag_llm_service", llm_service)
+        if profile.use_llm:
+            # PdfConverter publica la instancia que resolvió desde la ruta
+            # anterior. Se reutiliza para abrir/cerrar el presupuesto por
+            # documento sin tocar internals ni procesadores.
+            setattr(converter, "_rag_llm_service", converter.llm_service)
         return converter
     except Exception as exc:
         raise RuntimeError(f"No se pudo inicializar Marker: {exc}") from exc
@@ -433,7 +565,7 @@ def _render_with_marker(path: Path, marker_converter: Any) -> tuple[Any, dict[st
         metadata = rendered.get("metadata", metadata)
     if not isinstance(metadata, dict):
         metadata = {}
-    return rendered, metadata
+    return rendered, _metadata_with_marker_capabilities(metadata)
 
 
 def _marker_markdown_text(rendered: Any) -> str:
@@ -528,6 +660,123 @@ def _page_extraction_metadata(metadata: dict[str, Any], page_number: int) -> dic
     return extraction_metadata
 
 
+def _marker_polygon(block: dict[str, Any]) -> list[list[float]]:
+    polygon = _to_plain_data(block.get("polygon") or [])
+    if isinstance(polygon, dict):
+        polygon = polygon.get("polygon", [])
+    if not isinstance(polygon, list):
+        return []
+    return [list(point) for point in polygon if isinstance(point, (list, tuple))]
+
+
+def _marker_confidence(block: dict[str, Any], kind: str) -> float | None:
+    """Conserva confianza explícita sin inventar umbrales ni decisiones."""
+    confidence = block.get("confidence")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        return float(confidence)
+
+    top_k = block.get("top_k")
+    if isinstance(top_k, dict):
+        for label, value in top_k.items():
+            if str(label).lower() != kind.lower():
+                continue
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+    return None
+
+
+def _deduplicate(values: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    seen: set[Any] = set()
+    for value in values:
+        key = value
+        if isinstance(value, dict):
+            key = (value.get("page"), value.get("block_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _normalize_marker_element(
+    block: dict[str, Any],
+    *,
+    inherited_page: int | None = None,
+    reading_order: list[int] | None = None,
+) -> DocumentElement:
+    """Propaga solo procedencia observable en el JSON oficial de Marker."""
+    counter = reading_order if reading_order is not None else [0]
+    kind = str(block.get("block_type") or block.get("kind") or "Unknown")
+    block_id = str(block.get("id") or "")
+    page_number = _block_page_number(block, inherited_page)
+    polygon = _marker_polygon(block)
+
+    own_span: list[dict[str, Any]] = []
+    if block_id and kind.lower() not in {"document", "page"}:
+        own_span.append(
+            {
+                "page": page_number,
+                "block_id": block_id,
+                "polygon": polygon,
+                "reading_order": counter[0],
+            }
+        )
+        counter[0] += 1
+
+    raw_children = block.get("children")
+    children: list[DocumentElement] = []
+    if isinstance(raw_children, list):
+        for child in raw_children:
+            if isinstance(child, dict):
+                children.append(
+                    _normalize_marker_element(
+                        child,
+                        inherited_page=page_number,
+                        reading_order=counter,
+                    )
+                )
+
+    child_spans = [span for child in children for span in child.source_spans]
+    source_spans = _deduplicate([*own_span, *child_spans])
+    source_pages = sorted(
+        {
+            int(span["page"])
+            for span in source_spans
+            if isinstance(span.get("page"), int)
+        }
+    )
+    if not source_pages:
+        source_pages = [page_number]
+    source_block_ids = _deduplicate(
+        [
+            str(span["block_id"])
+            for span in source_spans
+            if str(span.get("block_id") or "")
+        ]
+    )
+
+    section_hierarchy = _to_plain_data(block.get("section_hierarchy") or {})
+    if not isinstance(section_hierarchy, dict):
+        section_hierarchy = {}
+
+    return DocumentElement(
+        id=block_id,
+        kind=kind,
+        html=str(block.get("html") or ""),
+        text=_text_from_marker_block(block),
+        page_start=min(source_pages),
+        page_end=max(source_pages),
+        source_pages=source_pages,
+        source_block_ids=source_block_ids,
+        source_spans=source_spans,
+        section_hierarchy=section_hierarchy,
+        polygon=polygon,
+        confidence=_marker_confidence(block, kind),
+        children=children,
+    )
+
+
 def _extract_marker_structured_chunks(
     rendered: Any,
     metadata: dict[str, Any] | None = None,
@@ -537,10 +786,11 @@ def _extract_marker_structured_chunks(
     if not isinstance(payload, dict):
         return []
 
-    effective_metadata = dict(metadata or {})
+    effective_metadata = _metadata_with_marker_capabilities(metadata or {})
     payload_metadata = payload.get("metadata")
     if isinstance(payload_metadata, dict):
         effective_metadata.update(payload_metadata)
+    effective_metadata = _metadata_with_marker_capabilities(effective_metadata)
 
     root_children = payload.get("children")
     candidates = (
@@ -557,37 +807,19 @@ def _extract_marker_structured_chunks(
     blocks = page_candidates or candidates
     structured_chunks: list[dict[str, Any]] = []
 
+    reading_order = [0]
     for block in blocks:
-        page_number = _block_page_number(block)
-        children = block.get("children")
-        plain_children = (
-            [_to_plain_data(child) for child in children]
-            if isinstance(children, list)
-            else []
-        )
-        polygon = _to_plain_data(block.get("polygon") or [])
-        if isinstance(polygon, dict):
-            polygon = polygon.get("polygon", [])
-        if not isinstance(polygon, list):
-            polygon = []
-
-        section_hierarchy = _to_plain_data(block.get("section_hierarchy") or {})
-        if not isinstance(section_hierarchy, dict):
-            section_hierarchy = {}
-
+        element = _normalize_marker_element(block, reading_order=reading_order)
+        element_data = element.as_dict()
         structured_chunks.append(
             {
-                "block_type": str(block.get("block_type") or "Unknown"),
-                "id": str(block.get("id") or ""),
-                "html": str(block.get("html") or ""),
-                "text": _text_from_marker_block(block),
-                "page": page_number,
-                "polygon": polygon,
-                "children": plain_children,
-                "section_hierarchy": section_hierarchy,
+                **element_data,
+                # Alias temporales consumidos por PageDocument y código previo.
+                "block_type": element.kind,
+                "page": element.page_start,
                 "extraction_metadata": _page_extraction_metadata(
                     effective_metadata,
-                    page_number,
+                    element.page_start,
                 ),
             }
         )
@@ -698,9 +930,15 @@ def _marker_document_pages(
                 "html": "",
                 "text": text,
                 "page": page_number,
+                "page_start": page_number,
+                "page_end": page_number,
+                "source_pages": [page_number],
+                "source_block_ids": [],
+                "source_spans": [],
                 "polygon": [],
                 "children": [],
                 "section_hierarchy": {},
+                "confidence": None,
                 "extraction_metadata": _page_extraction_metadata(metadata, page_number),
             }
             for page_number, text in _split_marker_markdown_by_page(markdown)
@@ -734,10 +972,101 @@ def _marker_document_pages(
                 polygon=chunk["polygon"],
                 children=chunk["children"],
                 section_hierarchy=chunk["section_hierarchy"],
+                page_start=int(chunk.get("page_start", page_number)),
+                page_end=int(chunk.get("page_end", page_number)),
+                source_pages=[int(page) for page in chunk.get("source_pages", [page_number])],
+                source_block_ids=[
+                    str(block_id) for block_id in chunk.get("source_block_ids", [])
+                ],
+                source_spans=[
+                    dict(span)
+                    for span in chunk.get("source_spans", [])
+                    if isinstance(span, dict)
+                ],
+                confidence=chunk.get("confidence"),
                 extraction_metadata=chunk["extraction_metadata"],
             )
         )
     return pages
+
+
+def _document_element_from_mapping(value: dict[str, Any]) -> DocumentElement:
+    children = [
+        _document_element_from_mapping(child)
+        for child in value.get("children", [])
+        if isinstance(child, dict)
+    ]
+    page_start = int(value.get("page_start", value.get("page", 1)))
+    page_end = int(value.get("page_end", page_start))
+    polygon = value.get("polygon", [])
+    return DocumentElement(
+        id=str(value.get("id") or ""),
+        kind=str(value.get("kind") or value.get("block_type") or "Unknown"),
+        html=str(value.get("html") or ""),
+        text=str(value.get("text") or ""),
+        page_start=page_start,
+        page_end=page_end,
+        source_pages=[int(page) for page in value.get("source_pages", [page_start])],
+        source_block_ids=[str(item) for item in value.get("source_block_ids", [])],
+        source_spans=[dict(span) for span in value.get("source_spans", [])],
+        section_hierarchy=dict(value.get("section_hierarchy") or {}),
+        polygon=[list(point) for point in polygon if isinstance(point, (list, tuple))],
+        confidence=value.get("confidence"),
+        children=children,
+    )
+
+
+def parsed_document_from_pages(path: Path, pages: list[PageDocument]) -> ParsedDocument:
+    """Agrupa PageDocument sin alterar ni inferir la estructura de Marker."""
+    elements = [
+        DocumentElement(
+            id=page.id,
+            kind=page.block_type or "Page",
+            html=page.html,
+            text=page.text,
+            page_start=int(page.page_start or page.page_number),
+            page_end=int(page.page_end or page.page_number),
+            source_pages=list(page.source_pages),
+            source_block_ids=list(page.source_block_ids),
+            source_spans=[dict(span) for span in page.source_spans],
+            section_hierarchy=dict(page.section_hierarchy),
+            polygon=[list(point) for point in page.polygon],
+            confidence=page.confidence,
+            children=[
+                _document_element_from_mapping(child)
+                for child in page.children
+                if isinstance(child, dict)
+            ],
+        )
+        for page in pages
+    ]
+
+    metadata: dict[str, Any] = {"capabilities": marker_capabilities()}
+    page_stats: list[dict[str, Any]] = []
+    seen_page_ids: set[Any] = set()
+    for page in pages:
+        for key, value in page.extraction_metadata.items():
+            if key != "page_stats":
+                metadata.setdefault(key, _to_plain_data(value))
+        for page_stat in page.extraction_metadata.get("page_stats", []) or []:
+            if not isinstance(page_stat, dict):
+                continue
+            page_id = page_stat.get("page_id")
+            if page_id in seen_page_ids:
+                continue
+            seen_page_ids.add(page_id)
+            page_stats.append(dict(page_stat))
+    if page_stats:
+        metadata["page_stats"] = page_stats
+
+    return ParsedDocument(
+        id=path.stem,
+        source=path.name,
+        source_path=str(path.resolve()),
+        source_type=path.suffix.lower().lstrip("."),
+        elements=elements,
+        metadata=metadata,
+    )
 
 
 def load_marker_document_pages(

@@ -114,10 +114,10 @@ class Marker2ConfigurationTests(unittest.TestCase):
         self.assertNotIn("from marker.builders.line import", source)
         self.assertNotIn("line_builder_class", source)
 
-    def test_marker_2_version_is_required(self) -> None:
-        with patch("rag_cliente.pdf_loader.version", return_value="1.10.2"):
-            with self.assertRaisesRegex(RuntimeError, "requiere marker-pdf 2.x"):
-                _require_marker_2()
+    def test_unvalidated_marker_version_warns_without_blocking(self) -> None:
+        with patch("rag_cliente.marker_capabilities.version", return_value="2.1.0"):
+            with self.assertWarnsRegex(RuntimeWarning, "solo se validaron"):
+                self.assertEqual(_require_marker_2(), "2.1.0")
 
     def test_quality_profile_fails_before_marker_without_local_vlm_endpoint(self) -> None:
         settings = Settings(
@@ -213,23 +213,34 @@ class Marker2MetadataTests(unittest.TestCase):
         chunks = _extract_marker_structured_chunks(rendered)
 
         self.assertEqual(len(chunks), 1)
-        self.assertEqual(
-            set(chunks[0]),
+        self.assertTrue(
             {
                 "block_type",
                 "id",
+                "kind",
                 "html",
                 "text",
                 "page",
+                "page_start",
+                "page_end",
+                "source_pages",
+                "source_block_ids",
+                "source_spans",
                 "polygon",
                 "children",
                 "section_hierarchy",
+                "confidence",
                 "extraction_metadata",
-            },
+            }.issubset(chunks[0]),
         )
         self.assertEqual(chunks[0]["page"], 1)
         self.assertEqual(chunks[0]["text"], "Texto útil")
         self.assertTrue(chunks[0]["extraction_metadata"]["page_stats"][0]["ocr_used"])
+        self.assertFalse(
+            chunks[0]["extraction_metadata"]["capabilities"][
+                "complete_multipage_table_support"
+            ]
+        )
 
 
 class GenericMarkerDocumentTests(unittest.TestCase):

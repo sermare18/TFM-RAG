@@ -14,7 +14,7 @@ dependencies = [
   "huggingface-hub>=0.27.0,<2.0.0",
   "lancedb>=0.17.0",
   "langchain-text-splitters>=0.3.0",
-  "marker-pdf[full]>=2.0.0,<3.0.0",
+  "marker-pdf[full]==2.0.0",
   "numpy>=1.26.0",
   "pillow>=10.2.0,<11.0.0",
   "openai>=2.2.0,<3.0.0",

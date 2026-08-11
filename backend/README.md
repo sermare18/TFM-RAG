@@ -68,6 +68,13 @@ Los perfiles son:
 - `gpu-quality`: `balanced`, OCR Surya con CUDA y LLM habilitado.
 - `auto`: `gpu-quality` con CUDA utilizable y `cpu-quality` en caso contrario.
 
+El proyecto fija `marker-pdf[full]==2.0.0`. En los perfiles de calidad, las
+tablas multipágina se fusionan mediante los procesadores oficiales de Marker
+solo cuando todas sus partes ya están clasificadas como `Table` o
+`TableOfContents`. Marker 2.0.0 no reclasifica `Text` a `Table`; por ello no se
+garantiza soporte completo para todas las tablas multipágina y `Table + Text`
+permanece separado deliberadamente.
+
 Marker usa salida JSON estructurada por defecto. Para conservar temporalmente
 el Markdown paginado anterior se puede definir
 `MARKER_MARKDOWN_COMPATIBILITY=true`. Los perfiles quality usan exclusivamente
@@ -123,6 +130,9 @@ etiquetas; por ejemplo, `data/pdfs/confidencial/contrato.pdf` recibe el tag
 
 # Validar cabeceras GGUF, mmproj y rutas sin cargar modelos
 .\rag.bat models check
+
+# Prueba manual acotada del parser (arranca los modelos locales configurados)
+.\rag.bat smoke-parser "data\pdfs\ejemplo.pdf" --profile cpu-quality --pages 0-2
 
 # Indexar data/pdfs
 .\rag.bat index

@@ -11,6 +11,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from PIL import Image
+
 from rag_cliente.cli import main as cli_main
 from rag_cliente.config import Settings
 from rag_cliente.marker_llm import (
@@ -21,6 +23,7 @@ from rag_cliente.marker_llm import (
 from rag_cliente.model_manifest import check_artifact
 from rag_cliente.model_supervisor import ModelServerSpec, ModelSupervisor
 from rag_cliente.pdf_loader import create_marker_converter
+from rag_cliente.pdf_loader import _build_marker_config
 from rag_cliente.pipeline import RagPipeline
 from rag_cliente.resource_coordinator import ResourceCoordinator
 
@@ -310,6 +313,19 @@ class MarkerBudgetTests(unittest.TestCase):
             settings.marker_llm_max_tokens_per_request,
         )
 
+    def test_marker_public_config_constructs_the_budgeted_local_service(self) -> None:
+        settings = Settings(
+            marker_profile="cpu-quality",
+            marker_llm_max_requests=7,
+            marker_llm_request_timeout=12,
+        )
+        service = BudgetedMarkerOpenAIService(_build_marker_config(settings))
+
+        self.assertEqual(service.openai_base_url, settings.marker_openai_base_url)
+        self.assertEqual(service.settings.marker_llm_max_requests, 7)
+        self.assertEqual(service.settings.marker_llm_request_timeout, 12)
+        self.assertEqual(service.max_retries, 1)
+
     def test_completion_token_budget_is_accumulated(self) -> None:
         settings = Settings(marker_llm_max_generated_tokens_per_document=3)
         service, _ = self._service(settings, [fake_response(4)])
@@ -335,6 +351,62 @@ class MarkerBudgetTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.details["budget"], "job_timeout_seconds")
         self.assertEqual(completions.calls, [])
+
+    def test_invalid_json_does_not_enter_a_repair_loop(self) -> None:
+        service, completions = self._service(
+            Settings(marker_llm_max_retries=1),
+            [fake_response(1, "{invalid"), fake_response(1)],
+        )
+
+        with self.assertRaises(MarkerLLMError) as raised:
+            with service.document_budget("doc"):
+                service("prompt", None, None, dict)
+
+        self.assertEqual(raised.exception.code, "local_llm_invalid_response")
+        self.assertEqual(len(completions.calls), 1)
+
+    def test_transient_failure_retries_at_most_once(self) -> None:
+        class FakeConnectionError(Exception):
+            pass
+
+        service, completions = self._service(
+            Settings(marker_llm_max_retries=1),
+            [FakeConnectionError(), FakeConnectionError(), fake_response(1)],
+        )
+
+        with patch("rag_cliente.marker_llm.APIConnectionError", FakeConnectionError):
+            with self.assertRaises(MarkerLLMError) as raised:
+                with service.document_budget("doc"):
+                    service("prompt", None, None, dict)
+
+        self.assertEqual(raised.exception.code, "local_llm_request_failed")
+        self.assertEqual(len(completions.calls), 2)
+
+    def test_multiple_images_are_preserved_and_rejection_has_no_fallback(self) -> None:
+        class FakeBadRequest(Exception):
+            pass
+
+        service, completions = self._service(
+            Settings(marker_llm_max_retries=1),
+            [FakeBadRequest()],
+        )
+        images = [Image.new("RGB", (2, 2)), Image.new("RGB", (2, 2))]
+
+        with patch("rag_cliente.marker_llm.BadRequestError", FakeBadRequest):
+            with self.assertRaises(MarkerLLMError) as raised:
+                with service.document_budget("doc"):
+                    service("prompt", images, None, dict)
+
+        self.assertEqual(
+            raised.exception.code,
+            "local_vlm_multiple_images_unsupported",
+        )
+        content = completions.calls[0]["messages"][0]["content"]
+        self.assertEqual(
+            sum(item.get("type") == "image_url" for item in content),
+            2,
+        )
+        self.assertEqual(len(completions.calls), 1)
 
     def test_external_endpoint_is_rejected(self) -> None:
         settings = Settings(marker_openai_base_url="https://api.openai.com/v1")

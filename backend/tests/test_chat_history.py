@@ -56,6 +56,10 @@ fake_pdf_loader.load_documents_from_directory = lambda doc_dir: []
 fake_vector_store.LanceDBStore = _FakeLanceDBStore
 fake_rank_bm25.BM25Okapi = _FakeBM25Okapi
 fake_openai.OpenAI = Mock
+fake_openai.APITimeoutError = type("APITimeoutError", (Exception,), {})
+fake_openai.RateLimitError = type("RateLimitError", (Exception,), {})
+fake_openai.APIConnectionError = type("APIConnectionError", (Exception,), {})
+fake_openai.BadRequestError = type("BadRequestError", (Exception,), {})
 
 sys.modules.setdefault("rag_cliente.indexer", fake_indexer)
 sys.modules.setdefault("rag_cliente.pdf_loader", fake_pdf_loader)
