@@ -16,9 +16,9 @@ from urllib.parse import urlparse
 
 import httpx
 
-from rag_cliente.config import Settings, resolve_marker_profile
+from rag_cliente.config import Settings, resolve_local_model_profile
 from rag_cliente.local_endpoints import is_local_model_endpoint
-from rag_cliente.model_manifest import check_artifact, resolve_runtime_role_paths
+from rag_cliente.model_manifest import resolve_runtime_model_path
 
 ServerMode = Literal["managed", "external"]
 
@@ -37,7 +37,6 @@ class ModelServerSpec:
     endpoint: str
     model_path: Path
     alias: str
-    mmproj_path: Path | None = None
     use_gpu: bool = False
     gpu_layers: int = 0
     context_size: int = 16384
@@ -105,50 +104,15 @@ def _health_url(endpoint: str) -> str:
 
 def build_server_specs(settings: Settings) -> dict[str, ModelServerSpec]:
     """Resuelve cada rol a rutas GGUF locales explícitas."""
-    profile = resolve_marker_profile(settings)
-    use_gpu = profile.name == "gpu-quality"
-    vlm_role = "vlm_gpu" if use_gpu else "vlm_cpu"
+    profile = resolve_local_model_profile(settings)
+    use_gpu = profile == "gpu"
     chat_role = "chat_gpu" if use_gpu else "chat_cpu"
 
-    surya_model, surya_mmproj = resolve_runtime_role_paths(settings, "surya")
-    vlm_model, vlm_mmproj = resolve_runtime_role_paths(settings, vlm_role)
-    if use_gpu and settings.vlm_gpu_custom_gguf_path.strip():
-        vlm_model = Path(settings.vlm_gpu_custom_gguf_path).expanduser().resolve()
-        vlm_mmproj = Path(settings.vlm_gpu_custom_mmproj_path).expanduser().resolve()
-        model_valid, model_message = check_artifact(vlm_model, "model")
-        mmproj_valid, mmproj_message = check_artifact(vlm_mmproj, "mmproj")
-        if not (model_valid and mmproj_valid):
-            raise ValueError(
-                "El VLM GPU Qwen3.5 alternativo no supera 'models check': "
-                f"modelo={model_message}; mmproj={mmproj_message}"
-            )
-    embeddings_model, _ = resolve_runtime_role_paths(settings, "embeddings")
-    chat_model, _ = resolve_runtime_role_paths(settings, chat_role)
+    embeddings_model = resolve_runtime_model_path(settings, "embeddings")
+    chat_model = resolve_runtime_model_path(settings, chat_role)
 
     gpu_layers = settings.model_gpu_layers if use_gpu else 0
     return {
-        "surya": ModelServerSpec(
-            role="surya",
-            mode=settings.model_surya_mode,
-            endpoint=settings.surya_base_url,
-            model_path=surya_model,
-            mmproj_path=surya_mmproj,
-            alias="datalab-to/surya-ocr-2",
-            use_gpu=use_gpu,
-            gpu_layers=gpu_layers,
-            context_size=settings.model_context_size,
-        ),
-        "vlm": ModelServerSpec(
-            role="vlm",
-            mode=settings.model_vlm_mode,
-            endpoint=settings.marker_openai_base_url,
-            model_path=vlm_model,
-            mmproj_path=vlm_mmproj,
-            alias=settings.marker_openai_model,
-            use_gpu=use_gpu,
-            gpu_layers=gpu_layers,
-            context_size=settings.model_context_size,
-        ),
         "embeddings": ModelServerSpec(
             role="embeddings",
             mode=settings.model_embeddings_mode,
@@ -210,15 +174,6 @@ class ModelSupervisor:
         model_path = spec.model_path.expanduser().resolve()
         if not model_path.is_file():
             raise FileNotFoundError(f"GGUF local no encontrado para {spec.role}: {model_path}")
-        if spec.mmproj_path is not None:
-            mmproj_path = spec.mmproj_path.expanduser().resolve()
-            if not mmproj_path.is_file():
-                raise FileNotFoundError(
-                    f"mmproj local no encontrado para {spec.role}: {mmproj_path}"
-                )
-        else:
-            mmproj_path = None
-
         host, port = _endpoint_host_port(spec.endpoint)
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError(
@@ -242,8 +197,6 @@ class ModelSupervisor:
             "-ngl",
             str(spec.gpu_layers if spec.use_gpu else 0),
         ]
-        if mmproj_path is not None:
-            command.extend(["--mmproj", str(mmproj_path)])
         if spec.embeddings:
             command.append("--embedding")
         command.extend(spec.extra_args)

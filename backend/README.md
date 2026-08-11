@@ -1,249 +1,106 @@
-# RAG Cliente
+# TFM RAG: Bedrock para documentos y modelos locales para consulta
 
-RAG local para indexar PDF, DOCX, PPTX, XLSX, EPUB, HTML, TXT e imágenes en
-LanceDB y consultarlos mediante CLI o una API compatible con aplicaciones web.
-Los documentos estructurados se procesan con Marker 2 mediante perfiles para
-CPU o GPU NVIDIA.
+El proyecto convierte documentos a Markdown con un VLM de Amazon Bedrock y
+mantiene en local las dos piezas del RAG que se usan repetidamente: embeddings
+y generación de respuestas mediante `llama.cpp`.
 
-## Requisitos
+## Arquitectura
 
-- Windows
-- Conda (Miniconda o Anaconda)
-- GPU NVIDIA y driver compatible con CUDA 13 (opcional)
-- `llama-server` local; la ruta predeterminada es
-  `C:\Users\SergioMartinReizabal\Documents\llama.cpp\llama-server.exe`
-- Modelos GGUF locales, administrados o expuestos como servidores `external`
+1. PyMuPDF renderiza cada página del PDF y obtiene texto digital auxiliar.
+2. Bedrock recibe cuatro páginas consecutivas por llamada. Las imágenes son la
+   fuente autoritativa; el texto extraído se etiqueta como referencia no fiable.
+3. La respuesta JSON contiene Markdown separado por página.
+4. El Markdown y un manifiesto con hash, modelo y prompt quedan en
+   `data/markdown`. Cada lote completado se guarda inmediatamente, por lo que
+   una cuota o corte posterior no obliga a pagar otra vez por esas páginas.
+5. El chunking nunca cruza una página. Una página grande puede producir varios
+   chunks con el mismo número de página.
+6. LanceDB guarda los vectores y BM25 el índice léxico. La recuperación admite
+   `vector`, `bm25` o `hybrid` mediante RRF.
+7. El modelo local de chat redacta la respuesta y devuelve citas con página.
 
-## Instalación
+Los `.md` entran directamente. Si contienen separadores `<!-- PAGE N -->`, se
+conserva la paginación; sin separadores se consideran una sola página.
 
-Desde esta carpeta:
+## Configuración de Bedrock
+
+`.env.example` deja Bedrock desactivado para que una instalación nueva nunca
+genere coste por accidente. Las credenciales se guardan en el perfil estándar
+de AWS, nunca en `.env` ni en el repositorio:
 
 ```powershell
-.\setup.ps1 -Device auto  # también admite cpu o cuda
-.\rag.bat gpu
+aws configure --profile rag-bedrock
 ```
 
-`setup.ps1` crea o actualiza el entorno `rag-cliente` con Python 3.11, instala
-explícitamente la distribución CPU o CUDA de PyTorch 2.12.1, instala las
-dependencias y el paquete local, y valida que la variante no haya cambiado.
-`auto` elige CUDA si `nvidia-smi` detecta una GPU utilizable y CPU en caso
-contrario. `cpu` o `cuda` siempre prevalecen sobre esa detección.
+Después se activa el perfil en `.env`:
 
-## Configuración
-
-Copia `.env.example` como `.env` y ajusta, como mínimo:
-
-```env
-LLAMA_CPP_CHAT_BASE_URL=http://127.0.0.1:8081/v1
-LLAMA_CPP_EMBEDDING_BASE_URL=http://127.0.0.1:8082/v1
-OPENAI_API_KEY=local-dev-key
-MARKER_PROFILE=auto
-MODEL_SUPERVISION_ENABLED=true
-LLAMA_CPP_BINARY=C:\Users\SergioMartinReizabal\Documents\llama.cpp\llama-server.exe
-MODELS_DIR=./models
+```dotenv
+BEDROCK_ENABLED=true
+AWS_PROFILE=rag-bedrock
+AWS_REGION=eu-west-1
+BEDROCK_MODEL_ID=qwen.qwen3-vl-235b-a22b
+BEDROCK_PAGES_PER_BATCH=4
+BEDROCK_MAX_PAGES_PER_DOCUMENT=200
+BEDROCK_MAX_BATCHES_PER_DOCUMENT=50
 ```
 
-Las opciones principales de almacenamiento y recuperación son:
+Mientras esté desactivado, los PDF solo se indexan si ya existe una caché
+Markdown válida. Los Markdown directos sí se pueden indexar. Los dos límites
+anteriores actúan como presupuesto duro por documento.
 
-```env
-LANCEDB_URI=./data/lancedb
-LANCEDB_TABLE=pdf_chunks
-DOCUMENTS_DIR=./data/pdfs
-RETRIEVAL_TOP_K=8
-CHUNK_TARGET_TOKENS=700
-CHUNK_MAX_TOKENS=900
-CHUNK_OVERLAP_TOKENS=100
-TABLE_CHUNK_MAX_TOKENS=1200
-HYBRID_SEARCH_ENABLED=true
-RRF_K=60
-VECTOR_CANDIDATES=40
-BM25_CANDIDATES=40
+Las cuentas AWS nuevas pueden recibir cuotas diarias reducidas. El error
+`Too many tokens per day` no indica un fallo del PDF: hay que esperar al reinicio
+diario o solicitar un aumento en **Service Quotas > Amazon Bedrock**. La siguiente
+ejecución reanuda el primer lote pendiente. Los modelos Anthropic requieren
+además enviar una vez el formulario de caso de uso desde la consola de Bedrock.
+
+## Preparación
+
+```powershell
+cd D:\master\RAG\backend
+.\setup.ps1
+Copy-Item .env.example .env   # solo si todavía no existe .env
+.\rag.bat doctor
 ```
 
-Marker 2 se controla principalmente con `MARKER_ENABLED`, `MARKER_PROFILE`,
-`MARKER_STRIP_EXISTING_OCR`, `MARKER_DISABLE_IMAGE_EXTRACTION` y
-`MARKER_PAGE_RANGE`.
+Los modelos locales nunca se descargan durante el indexado:
 
-Los perfiles son:
-
-- `cpu-digital`: `fast`, OCR deshabilitado y sin LLM.
-- `cpu-quality`: `fast`, OCR Surya mediante llama.cpp y LLM habilitado.
-- `gpu-quality`: `balanced`, OCR Surya con CUDA y LLM habilitado.
-- `auto`: `gpu-quality` con CUDA utilizable y `cpu-quality` en caso contrario.
-
-El proyecto fija `marker-pdf[full]==2.0.0`. En los perfiles de calidad, las
-tablas multipágina se fusionan mediante los procesadores oficiales de Marker
-solo cuando todas sus partes ya están clasificadas como `Table` o
-`TableOfContents`. Marker 2.0.0 no reclasifica `Text` a `Table`; por ello no se
-garantiza soporte completo para todas las tablas multipágina y `Table + Text`
-permanece separado deliberadamente.
-
-Marker usa salida JSON estructurada por defecto. Para conservar temporalmente
-el Markdown paginado anterior se puede definir
-`MARKER_MARKDOWN_COMPATIBILITY=true`. Los perfiles quality usan exclusivamente
-el servicio OpenAI-compatible de Marker mediante el wrapper local presupuestado
-del proyecto. `MARKER_OPENAI_BASE_URL` debe ser loopback, una IP privada o un
-host incluido en `LOCAL_MODEL_HOSTS`; no existe fallback a Gemini ni a APIs
-externas.
-
-El indexador consume la estructura documental de Marker, no su texto aplanado.
-Los bloques ya clasificados por Marker como `Table` o `TableOfContents`
-conservan HTML, filas completas, cabeceras estructurales, identificadores y
-páginas de origen; una fila nunca se parte y una fila excepcionalmente grande se
-marca como `oversize`. Los bloques `Text` nunca se reclasifican como tabla. El
-texto consecutivo de una misma sección puede formar un chunk multipágina, pero
-un cambio de sección impide esa unión.
-
-LanceDB y BM25 usan el esquema de índice v2 y la recuperación híbrida se fusiona
-mediante RRF (`k=60`) antes de seleccionar los resultados finales. Un índice
-anterior se rechaza deliberadamente con una instrucción clara de reindexado;
-ejecuta `rag.bat index` una vez tras actualizar esta versión.
-
-Los procesos `managed` son creados por el supervisor, que conserva sus PIDs,
-espera `/health`, escribe logs en `MODEL_LOGS_DIR` y solo detiene esos procesos.
-Un rol `external` nunca se inicia ni se detiene desde la aplicación. Parser,
-embeddings y chat se serializan mediante leases FIFO: durante indexación no se
-carga chat y embeddings se descarga antes de cargar chat.
-
-Presupuestos iniciales relevantes:
-
-```env
-MODEL_START_TIMEOUT=180
-MODEL_REQUEST_TIMEOUT=180
-MODEL_STOP_TIMEOUT=15
-PARSER_JOB_TIMEOUT=1800
-MODEL_MAX_RETRIES=1
-MARKER_LLM_MAX_REQUESTS=50
-MARKER_LLM_MAX_TOKENS_PER_REQUEST=4096
-MARKER_LLM_MAX_GENERATED_TOKENS_PER_DOCUMENT=20000
-MARKER_LLM_REQUEST_TIMEOUT=180
-MARKER_LLM_JOB_TIMEOUT=1800
-MARKER_LLM_MAX_RETRIES=1
-MARKER_LLM_FALLBACK_TO_BASE=false
+```powershell
+.\rag.bat models plan gpu
+.\rag.bat models download gpu
+.\rag.bat models check --profile gpu
 ```
+
+El perfil GPU conserva Qwen3 Embedding 0.6B y Qwen3.5 9B para respuesta. El
+perfil CPU usa el mismo embedding y Qwen3 4B para respuesta.
 
 ## Uso
 
-Coloca los documentos en `data/pdfs`. Se admiten PDF, DOCX, PPTX, XLSX, EPUB,
-HTML, TXT, PNG, JPG, JPEG, BMP, TIF, TIFF y WEBP. Las subcarpetas se usan como
-etiquetas; por ejemplo, `data/pdfs/confidencial/contrato.pdf` recibe el tag
-`confidencial`.
+```powershell
+# Indexa PDF y Markdown; reutiliza la caché Bedrock válida
+.\rag.bat index data\pdfs
+
+# Fuerza una nueva conversión de los PDF
+.\rag.bat index data\pdfs --refresh-bedrock
+
+# Consulta
+.\rag.bat ask "¿Qué indica el documento?" --top-k 5
+
+# API y visor
+.\rag.bat api
+.\rag.bat viewer
+```
+
+Cambiar `RETRIEVAL_MODE=vector|bm25|hybrid` y `RETRIEVAL_TOP_K` permite comparar
+configuraciones sobre el mismo índice. El resultado recuperado se colapsa por
+página, lo que deja preparado el cálculo posterior de precisión y recall.
+
+## Verificación
 
 ```powershell
-# Comprobar la GPU
-.\rag.bat gpu
-
-# Diagnóstico sin arrancar modelos
-.\rag.bat doctor
-
-# Ver planes y tamaños sin descargar
-.\rag.bat models plan cpu
-.\rag.bat models plan gpu
-
-# Descargar solo por petición explícita
-.\rag.bat models download cpu
-.\rag.bat models download gpu
-
-# Validar cabeceras GGUF, mmproj y rutas sin cargar modelos
-.\rag.bat models check
-
-# Prueba manual acotada del parser (arranca los modelos locales configurados)
-.\rag.bat smoke-parser "data\pdfs\ejemplo.pdf" --profile cpu-quality --pages 0-2
-
-# Indexar data/pdfs
-.\rag.bat index
-
-# Indexar otra carpeta
-.\rag.bat index "D:\documentos"
-
-# Consultar
-.\rag.bat ask "Resume el contrato"
-
-# Activar thinking solo para esta consulta y mostrar el razonamiento
-.\rag.bat ask "Analiza las alternativas" --stream --show-reasoning
-
-# Arrancar la API en el puerto 8000
-.\rag.bat api
-
-# Arrancar la API en otro puerto
-.\rag.bat api 8088
-
-# Abrir el visor de LanceDB
-.\rag.bat viewer
-
-# Ejecutar los tests
 .\rag.bat test
 ```
 
-La API se ejecuta en primer plano y se detiene con `Ctrl+C`. Swagger queda
-disponible en `http://localhost:8000/docs`.
-
-`models plan`, `models check` y `doctor` nunca descargan ni arrancan modelos.
-`models download` usa Hugging Face Hub únicamente cuando el usuario ejecuta el
-comando y deja los artefactos bajo `MODELS_DIR`; tampoco arranca `llama-server`.
-El perfil GPU descarga para chat el GGUF Q4_K_M de Qwen3.5 9B publicado por
-`bartowski`, cuantizado a partir de los pesos oficiales de `Qwen/Qwen3.5-9B`.
-
-## API HTTP
-
-Endpoints principales:
-
-- `GET /health`
-- `GET /files`
-- `GET /files/{path}`
-- `POST /files/upload`
-- `POST /sessions`
-- `DELETE /sessions/{session_id}`
-- `POST /index`
-- `POST /ask`
-- `POST /ask/stream`
-
-Ejemplos:
-
-```powershell
-curl http://localhost:8000/health
-
-curl -X POST http://localhost:8000/index `
-  -H "Content-Type: application/json" `
-  -d '{"doc_dir":"data/pdfs"}'
-
-curl -X POST http://localhost:8000/ask `
-  -H "Content-Type: application/json" `
-  -d '{"question":"Resume el documento","top_k":8}'
-```
-
-`POST /files/upload` admite un campo multipart `tag`. `/ask` acepta `tag` o
-`tags`; si se envían varias etiquetas, se usa la primera no vacía.
-El razonamiento está desactivado por defecto; envía `"enable_reasoning": true`
-en `/ask` o `/ask/stream` para activarlo en una petición concreta.
-En streaming, el reasoning se emite token a token hasta
-`REASONING_MAX_TOKENS` y la respuesta final continúa en el mismo flujo también
-token a token. Esto evita que Qwen3.5 consuma indefinidamente toda la generación
-sin llegar a producir una respuesta.
-
-## Estructura
-
-```text
-backend/
-├─ data/
-│  ├─ pdfs/
-│  ├─ lancedb/       # generado
-│  └─ bm25/          # generado
-├─ src/rag_cliente/
-├─ tests/
-├─ .env
-├─ requirements.txt
-├─ pyproject.toml
-├─ setup.ps1
-└─ rag.bat
-```
-
-## Diagnóstico
-
-Si CUDA no está disponible, ejecuta `setup.ps1 -Device cpu`. Si seleccionas
-`MARKER_PROFILE=gpu-quality`, el indexador se detiene con un mensaje explícito
-si PyTorch no detecta la GPU; nunca cambia silenciosamente a CPU.
-
-Si LanceDB indica que no existe `pdf_chunks`, añade documentos y ejecuta
-`rag.bat index`. Si un endpoint devuelve timeout, aumenta `MODEL_REQUEST_TIMEOUT` en
-`.env` y comprueba que los servidores de chat y embeddings estén accesibles.
+Los tests de Bedrock usan un cliente falso: no acceden a AWS ni cargan modelos.
+Al cambiar desde un índice antiguo hay que ejecutar de nuevo `index`, porque el
+esquema actual guarda procedencia Bedrock y posición del chunk dentro de página.

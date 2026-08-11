@@ -1,23 +1,18 @@
-"""Orquestación del flujo completo RAG.
+"""Orchestration for Bedrock ingestion and local RAG retrieval/generation."""
 
-Conecta carga de documentos, chunking, embeddings, almacenamiento vectorial,
-recuperación y generación.
-"""
 from __future__ import annotations
 
 import gc
-import sys
 import threading
-import time
 from pathlib import Path
 from typing import Any, Callable
 
+from rag_cliente.bedrock_parser import BedrockMarkdownParser
 from rag_cliente.bm25_store import BM25Store
-from rag_cliente.config import Settings, resolve_marker_profile
-from rag_cliente.indexer import PdfChunker
+from rag_cliente.config import Settings
+from rag_cliente.indexer import MarkdownChunker
 from rag_cliente.llm_client import LlamaCppClient
 from rag_cliente.model_supervisor import ModelSupervisor
-from rag_cliente.pdf_loader import load_documents_from_directory
 from rag_cliente.resource_coordinator import get_resource_coordinator
 from rag_cliente.vector_store import LanceDBStore
 
@@ -25,19 +20,23 @@ ProgressCallback = Callable[[str], None]
 
 
 class RagPipeline:
-    """Facade principal del sistema RAG."""
+    """Small facade for indexing, retrieval and answer generation."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        document_parser: BedrockMarkdownParser | None = None,
+    ) -> None:
         self.settings = settings
         self.client = LlamaCppClient(settings)
-        self.chunker = PdfChunker(settings)
+        self.document_parser = document_parser or BedrockMarkdownParser(settings)
+        self.chunker = MarkdownChunker(settings)
         self.store = LanceDBStore(settings.lancedb_path, settings.lancedb_table)
         self.bm25_store = BM25Store(settings.bm25_index_path)
         self.coordinator = get_resource_coordinator()
         self.supervisor = (
-            ModelSupervisor(settings)
-            if settings.model_supervision_enabled
-            else None
+            ModelSupervisor(settings) if settings.model_supervision_enabled else None
         )
 
     def _ensure_models(self, roles: tuple[str, ...]) -> None:
@@ -58,83 +57,45 @@ class RagPipeline:
 
     @staticmethod
     def _release_model_memory() -> None:
-        """Libera referencias Python/CUDA sin importar frameworks nuevos."""
         gc.collect()
-        torch_module = sys.modules.get("torch")
-        cuda = getattr(torch_module, "cuda", None)
-        if cuda is not None:
-            try:
-                if cuda.is_available():
-                    cuda.empty_cache()
-            except (AttributeError, RuntimeError):
-                pass
 
     @staticmethod
-    def _emit(progress_callback: ProgressCallback | None, message: str) -> None:
-        if progress_callback is not None:
-            progress_callback(message)
+    def _emit(callback: ProgressCallback | None, message: str) -> None:
+        if callback is not None:
+            callback(message)
 
     def index_documents(
         self,
         doc_dir: Path,
         tag: str | None = None,
         progress_callback: ProgressCallback | None = None,
+        *,
+        refresh_bedrock: bool = False,
     ) -> int:
-        """Indexa todos los documentos soportados de un directorio.
-
-        Flujo:
-        1. cargar documentos
-        2. trocear texto
-        3. generar embeddings
-        4. persistir en LanceDB
-        """
+        """Index PDF/Markdown documents, reusing the paid Markdown cache."""
         self._emit(progress_callback, f"Iniciando indexado en: {doc_dir}")
-        with self.coordinator.acquire_indexing(timeout=self.settings.parser_job_timeout):
-            parser_started_at = time.monotonic()
-            with self.coordinator.acquire(
-                "parser_bundle",
-                workload="index",
-                timeout=self.settings.parser_job_timeout,
-            ):
-                profile = resolve_marker_profile(self.settings)
-                parser_roles = ("surya", "vlm") if profile.use_llm else ()
-                self._ensure_models(parser_roles)
-                try:
-                    pages = load_documents_from_directory(
-                        doc_dir,
-                        settings=self.settings,
-                        progress_callback=progress_callback,
-                    )
-                    parser_elapsed = time.monotonic() - parser_started_at
-                    if parser_elapsed > self.settings.parser_job_timeout:
-                        raise TimeoutError(
-                            f"PARSER_JOB_TIMEOUT excedido: {parser_elapsed:.1f}s"
-                        )
-                finally:
-                    self._stop_models(parser_roles)
-                    self._release_model_memory()
-
-            self._emit(progress_callback, f"Total de páginas/bloques extraídos: {len(pages)}")
-
-            normalized_tag = (tag or "").strip()
-            if normalized_tag:
-                self._emit(progress_callback, f"Aplicando tag a los chunks: {normalized_tag}")
-
-            self._emit(progress_callback, "Chunking de documentos...")
-            chunks = self.chunker.chunk_pages(pages, tag=normalized_tag or None)
-            self._emit(progress_callback, f"Chunks generados: {len(chunks)}")
-            if not chunks:
-                self._emit(progress_callback, "Indexado completado: no hay chunks para guardar.")
-                return 0
-
+        with self.coordinator.acquire_indexing(timeout=self.settings.index_job_timeout):
+            documents = self.document_parser.load_directory(
+                doc_dir,
+                refresh=refresh_bedrock,
+                progress_callback=progress_callback,
+            )
+            page_count = sum(len(document.pages) for document in documents)
             self._emit(
                 progress_callback,
-                f"Generando embeddings en lotes de {max(1, self.settings.embedding_batch_size)}...",
+                f"Documentos: {len(documents)}; paginas Markdown: {page_count}",
             )
+
+            chunks = self.chunker.chunk_documents(documents, tag=tag)
+            self._emit(progress_callback, f"Chunks por pagina: {len(chunks)}")
+            if not chunks:
+                self._emit(progress_callback, "No hay contenido que indexar.")
+                return 0
+
             with self.coordinator.acquire(
                 "embeddings",
                 workload="index",
-                timeout=self.settings.parser_job_timeout,
+                timeout=self.settings.index_job_timeout,
             ):
                 self._ensure_models(("embeddings",))
                 try:
@@ -146,22 +107,19 @@ class RagPipeline:
                     self._stop_models(("embeddings",))
                     self._release_model_memory()
 
-            self._emit(progress_callback, f"Guardando {len(chunks)} chunks en LanceDB...")
+            self._emit(progress_callback, "Guardando LanceDB y BM25...")
             self.store.replace_chunks(chunks, embeddings)
-
-            if self.settings.hybrid_search_enabled:
-                self._emit(progress_callback, "Guardando índice BM25 para búsqueda híbrida...")
-                self.bm25_store.replace_chunks(chunks)
-
+            # Always persist both indexes so evaluation can switch retrieval mode
+            # without paying for or repeating document parsing.
+            self.bm25_store.replace_chunks(chunks)
             self._emit(
                 progress_callback,
-                f"Indexado completado en tabla '{self.settings.lancedb_table}'.",
+                f"Indexado completado en '{self.settings.lancedb_table}'.",
             )
             return len(chunks)
-    
+
     @staticmethod
     def _is_contextual_retrieval_query(query: str) -> bool:
-        """Detecta queries contextuales generadas para embeddings, no para BM25."""
         return (
             "Previous user question:" in query
             or "Latest follow-up question:" in query
@@ -173,38 +131,33 @@ class RagPipeline:
         rewritten_question: str,
         messages: list[dict[str, str]] | None = None,
     ) -> list[str]:
-        """Construye variantes de consulta para recuperar mejor follow-ups cortas."""
         queries: list[str] = []
-
         for candidate in (rewritten_question, question):
-            normalized_candidate = candidate.strip()
-            if normalized_candidate and normalized_candidate not in queries:
-                queries.append(normalized_candidate)
+            normalized = candidate.strip()
+            if normalized and normalized not in queries:
+                queries.append(normalized)
 
-        normalized_messages = [
+        history = [
             {
                 "role": str(message.get("role", "")).strip(),
                 "content": str(message.get("content", "")).strip(),
             }
             for message in (messages or [])
-            if str(message.get("role", "")).strip() and str(message.get("content", "")).strip()
+            if str(message.get("role", "")).strip()
+            and str(message.get("content", "")).strip()
         ]
-        user_messages = [message["content"] for message in normalized_messages if message["role"] == "user"]
-        previous_user_message = user_messages[-1] if user_messages else ""
-
-        if previous_user_message:
-            contextual_query = (
-                f"Previous user question: {previous_user_message}\n"
+        prior_users = [item["content"] for item in history if item["role"] == "user"]
+        if prior_users:
+            contextual = (
+                f"Previous user question: {prior_users[-1]}\n"
                 f"Latest follow-up question: {question.strip()}"
             )
-            if contextual_query not in queries:
-                queries.append(contextual_query)
-
+            if contextual not in queries:
+                queries.append(contextual)
         return queries
 
     @staticmethod
     def _match_key(match: dict[str, Any]) -> tuple[Any, ...]:
-        """Identificador estable de un chunk para fusionar resultados."""
         stable_id = match.get("chunk_id") or match.get("id")
         if stable_id:
             return (stable_id,)
@@ -213,26 +166,23 @@ class RagPipeline:
             match.get("source_path"),
             match.get("chunk_index"),
         )
-    
+
     @staticmethod
     def _vector_score(match: dict[str, Any]) -> float:
-        """Convierte distancia vectorial en score donde mayor es mejor."""
         distance = match.get("_distance")
         if not isinstance(distance, (int, float)):
             return 0.0
         return 1.0 / (1.0 + max(float(distance), 0.0))
-    
+
     @classmethod
     def _merge_matches(
         cls,
         match_groups: list[list[dict[str, Any]]],
         top_k: int,
     ) -> list[dict[str, Any]]:
-        """Fusiona resultados vectoriales quedándose con la mejor distancia."""
         merged: dict[tuple[Any, ...], dict[str, Any]] = {}
-
         for matches in match_groups:
-            for index, match in enumerate(matches):
+            for rank, match in enumerate(matches):
                 key = cls._match_key(match)
                 distance = match.get("_distance")
                 normalized_distance = (
@@ -240,116 +190,33 @@ class RagPipeline:
                     if isinstance(distance, (int, float))
                     else float("inf")
                 )
-
                 candidate = {
                     **match,
-                    "_rank": index,
+                    "_merge_rank": rank,
                     "_normalized_distance": normalized_distance,
                 }
-
                 current = merged.get(key)
-                if current is None:
+                if current is None or (
+                    normalized_distance,
+                    rank,
+                ) < (
+                    current["_normalized_distance"],
+                    current["_merge_rank"],
+                ):
                     merged[key] = candidate
-                    continue
 
-                current_distance = current["_normalized_distance"]
-                current_rank = current["_rank"]
-
-                if (normalized_distance, index) < (current_distance, current_rank):
-                    merged[key] = candidate
-
-        ordered_matches = sorted(
+        ordered = sorted(
             merged.values(),
-            key=lambda item: (item["_normalized_distance"], item["_rank"]),
+            key=lambda item: (item["_normalized_distance"], item["_merge_rank"]),
         )
-
         return [
             {
                 key: value
                 for key, value in match.items()
-                if key not in {"_rank", "_normalized_distance"}
+                if key not in {"_merge_rank", "_normalized_distance"}
             }
-            for match in ordered_matches[:top_k]
+            for match in ordered[:top_k]
         ]
-    
-    @staticmethod
-    def _citation_from_match(match: dict[str, Any], source_id: str) -> dict[str, Any]:
-        """Crea la cita de un chunk recuperado con un ID auditable por el LLM."""
-        return {
-            "source_id": source_id,
-            "chunk_id": match.get("chunk_id") or match.get("id"),
-            "document_id": match["document_id"],
-            "kind": match.get("kind"),
-            "table_id": match.get("table_id"),
-            "source": match["source"],
-            "source_path": match["source_path"],
-            "source_type": match["source_type"],
-            "page_start": match["page_start"],
-            "page_end": match["page_end"],
-            "source_pages": list(match.get("source_pages") or []),
-            "chunk_index": match["chunk_index"],
-            "ocr_used": bool(match.get("ocr_used", False)),
-            "tag": match.get("tag") or None,
-        }
-
-    @staticmethod
-    def _page_label(page_start: int, page_end: int) -> str:
-        return f"p.{page_start}" if page_start == page_end else f"pp.{page_start}-{page_end}"
-
-    @staticmethod
-    def _source_option_from_match(match: dict[str, Any], source_id: str) -> dict[str, Any]:
-        """Prepara un candidato de fuente para la auditoría posterior a la respuesta."""
-        return {
-            "source_id": source_id,
-            "chunk_id": match.get("chunk_id") or match.get("id"),
-            "document_id": match.get("document_id"),
-            "kind": match.get("kind"),
-            "table_id": match.get("table_id"),
-            "source": match.get("source"),
-            "source_path": match.get("source_path"),
-            "source_type": match.get("source_type"),
-            "page_start": match.get("page_start"),
-            "page_end": match.get("page_end"),
-            "source_pages": list(match.get("source_pages") or []),
-            "chunk_index": match.get("chunk_index"),
-            "tag": match.get("tag") or None,
-            "text": match.get("text", ""),
-        }
-
-    @staticmethod
-    def _filter_citations_by_source_ids(
-        citations: list[dict[str, Any]],
-        used_source_ids: list[str],
-    ) -> list[dict[str, Any]]:
-        """Filtra las citas recuperadas dejando solo las usadas por la respuesta."""
-        allowed_ids = set(used_source_ids)
-        if not allowed_ids:
-            return []
-
-        return [
-            citation
-            for citation in citations
-            if str(citation.get("source_id", "")).strip() in allowed_ids
-        ]
-
-    def _select_used_citations(
-        self,
-        question: str,
-        answer: str,
-        generation_inputs: dict[str, Any],
-        messages: list[dict[str, str]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Audita la respuesta final y devuelve solo las citas realmente usadas."""
-        used_source_ids = self.client.select_used_source_ids(
-            question=question,
-            answer=answer,
-            source_options=generation_inputs["source_options"],
-            messages=messages,
-        )
-        return self._filter_citations_by_source_ids(
-            generation_inputs["citations"],
-            used_source_ids,
-        )
 
     @classmethod
     def _merge_hybrid_matches(
@@ -360,18 +227,14 @@ class RagPipeline:
         rrf_k: int = 60,
         **_legacy_options: Any,
     ) -> list[dict[str, Any]]:
-        """Fusiona rankings con RRF sin mezclar escalas vectoriales y BM25."""
         merged: dict[tuple[Any, ...], dict[str, Any]] = {}
 
-        def best_ranks(
-            groups: list[list[dict[str, Any]]],
-        ) -> dict[tuple[Any, ...], tuple[int, dict[str, Any]]]:
+        def best_ranks(groups: list[list[dict[str, Any]]]):
             best: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
             for matches in groups:
                 for rank, match in enumerate(matches, start=1):
                     key = cls._match_key(match)
-                    current = best.get(key)
-                    if current is None or rank < current[0]:
+                    if key not in best or rank < best[key][0]:
                         best[key] = (rank, match)
             return best
 
@@ -380,15 +243,10 @@ class RagPipeline:
             ("bm25", bm25_match_groups),
         ):
             for key, (rank, match) in best_ranks(groups).items():
-                item = merged.get(key)
-                if item is None:
-                    item = dict(match)
-                    item["_retrieval_sources"] = []
-                    merged[key] = item
-                else:
-                    for field, value in match.items():
-                        item.setdefault(field, value)
-
+                item = merged.setdefault(key, dict(match))
+                item.setdefault("_retrieval_sources", [])
+                for field, value in match.items():
+                    item.setdefault(field, value)
                 item[f"_{source}_rank"] = rank
                 if source == "vector":
                     item["_vector_score"] = cls._vector_score(match)
@@ -399,12 +257,11 @@ class RagPipeline:
 
         for item in merged.values():
             item["_rrf_score"] = sum(
-                1.0 / (rrf_k + int(item[rank_field]))
-                for rank_field in ("_vector_rank", "_bm25_rank")
-                if rank_field in item
+                1.0 / (rrf_k + int(item[field]))
+                for field in ("_vector_rank", "_bm25_rank")
+                if field in item
             )
-
-        ordered_matches = sorted(
+        return sorted(
             merged.values(),
             key=lambda item: (
                 -float(item.get("_rrf_score", 0.0)),
@@ -412,9 +269,134 @@ class RagPipeline:
                 int(item.get("_bm25_rank", 10**9)),
                 str(item.get("chunk_id") or item.get("id") or ""),
             ),
-        )
+        )[:top_k]
 
-        return ordered_matches[:top_k]
+    @staticmethod
+    def _collapse_to_pages(matches: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+        """Return at most one ranked hit per source page for page-level evals."""
+        selected: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for match in matches:
+            key = (str(match.get("document_id", "")), int(match.get("page_start", 0)))
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(match)
+            if len(selected) >= top_k:
+                break
+        return selected
+
+    def _retrieve(
+        self,
+        queries: list[str],
+        *,
+        top_k: int,
+        tag: str | None,
+    ) -> list[dict[str, Any]]:
+        mode = self.settings.retrieval_mode
+        vector_groups: list[list[dict[str, Any]]] = []
+        bm25_groups: list[list[dict[str, Any]]] = []
+
+        if mode in {"vector", "hybrid"}:
+            with self.coordinator.acquire(
+                "embeddings",
+                workload="query",
+                timeout=self.settings.model_request_timeout,
+            ):
+                self._ensure_models(("embeddings",))
+                try:
+                    query_vectors = self.client.embed_texts(queries)
+                    vector_groups = [
+                        self.store.search(
+                            vector,
+                            top_k=self.settings.vector_candidates,
+                            tag=tag,
+                        )
+                        for vector in query_vectors
+                    ]
+                finally:
+                    self._stop_models(("embeddings",))
+                    self._release_model_memory()
+
+        if mode in {"bm25", "hybrid"}:
+            lexical_queries = [
+                query for query in queries if not self._is_contextual_retrieval_query(query)
+            ]
+            bm25_groups = [
+                self.bm25_store.search(
+                    query,
+                    top_k=self.settings.bm25_candidates,
+                    tag=tag,
+                )
+                for query in lexical_queries
+            ]
+
+        candidate_limit = max(
+            top_k * 4,
+            self.settings.vector_candidates,
+            self.settings.bm25_candidates,
+        )
+        if mode == "vector":
+            ranked = self._merge_matches(vector_groups, candidate_limit)
+        elif mode == "bm25":
+            ranked = self._merge_hybrid_matches(
+                [], bm25_groups, candidate_limit, rrf_k=self.settings.rrf_k
+            )
+        else:
+            ranked = self._merge_hybrid_matches(
+                vector_groups,
+                bm25_groups,
+                candidate_limit,
+                rrf_k=self.settings.rrf_k,
+            )
+        return self._collapse_to_pages(ranked, top_k)
+
+    @staticmethod
+    def _citation_from_match(match: dict[str, Any], source_id: str) -> dict[str, Any]:
+        return {
+            "source_id": source_id,
+            "chunk_id": match.get("chunk_id") or match.get("id"),
+            "document_id": match["document_id"],
+            "source": match["source"],
+            "source_path": match["source_path"],
+            "source_type": match["source_type"],
+            "page_start": match["page_start"],
+            "page_end": match["page_end"],
+            "source_pages": list(match.get("source_pages") or []),
+            "chunk_index": match["chunk_index"],
+            "page_chunk_index": match.get("page_chunk_index", 0),
+            "tag": match.get("tag") or None,
+        }
+
+    @staticmethod
+    def _source_option_from_match(match: dict[str, Any], source_id: str) -> dict[str, Any]:
+        return {
+            **RagPipeline._citation_from_match(match, source_id),
+            "text": match.get("text", ""),
+        }
+
+    @staticmethod
+    def _filter_citations_by_source_ids(
+        citations: list[dict[str, Any]],
+        used_source_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        allowed = set(used_source_ids)
+        return [item for item in citations if item.get("source_id") in allowed]
+
+    def _select_used_citations(
+        self,
+        question: str,
+        answer: str,
+        generation_inputs: dict[str, Any],
+        messages: list[dict[str, str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        used = self.client.select_used_source_ids(
+            question=question,
+            answer=answer,
+            source_options=generation_inputs["source_options"],
+            messages=messages,
+        )
+        return self._filter_citations_by_source_ids(generation_inputs["citations"], used)
 
     def _prepare_generation_inputs(
         self,
@@ -423,126 +405,26 @@ class RagPipeline:
         messages: list[dict[str, str]] | None = None,
         tag: str | None = None,
     ) -> dict[str, Any]:
-        """Recupera el contexto RAG y genera metadatos compartidos."""
-        top_k = top_k or self.settings.effective_retrieval_top_k
-        retrieval_query = self.client.rewrite_question_for_retrieval(question, messages=messages)
-        retrieval_queries = self._build_retrieval_queries(question, retrieval_query, messages=messages)
+        effective_top_k = top_k or self.settings.effective_retrieval_top_k
+        rewritten = self.client.rewrite_question_for_retrieval(question, messages=messages)
+        queries = self._build_retrieval_queries(question, rewritten, messages=messages)
+        matches = self._retrieve(
+            queries,
+            top_k=effective_top_k,
+            tag=(tag or "").strip() or None,
+        )
 
-
-        # Debug de consultas de retrieval, ver en consola en la que lanzamos la API
-
-        print("\n" + "=" * 80, flush=True)
-        print("[RAG DEBUG] Nueva interacción", flush=True)
-        print(f"[RAG DEBUG] Pregunta original: {question}", flush=True)
-        print(f"[RAG DEBUG] retrieval_query: {retrieval_query}", flush=True)
-        print("[RAG DEBUG] retrieval_queries:", flush=True)
-
-        for index, query in enumerate(retrieval_queries, start=1):
-            print(f"  {index}. {query}", flush=True)
-
-            print("=" * 80 + "\n", flush=True)
-        
-        # FIN debug
-
-        normalized_tag = (tag or "").strip()
-        with self.coordinator.acquire(
-            "embeddings",
-            workload="query",
-            timeout=self.settings.model_request_timeout,
-        ):
-            self._ensure_models(("embeddings",))
-            try:
-                query_vectors = self.client.embed_texts(retrieval_queries)
-                vector_match_groups = [
-                    self.store.search(
-                        query_vector,
-                        top_k=self.settings.vector_candidates,
-                        tag=normalized_tag or None,
-                    )
-                    for query_vector in query_vectors
-                ]
-            finally:
-                # Embeddings se descarga antes de solicitar el lease de chat.
-                self._stop_models(("embeddings",))
-                self._release_model_memory()
-
-        if self.settings.hybrid_search_enabled:
-            bm25_queries = [
-                query
-                for query in retrieval_queries
-                if not self._is_contextual_retrieval_query(query)
-            ]
-
-            bm25_match_groups = [
-                self.bm25_store.search(
-                    query,
-                    top_k=self.settings.bm25_candidates,
-                    tag=normalized_tag or None,
-                )
-                for query in bm25_queries
-            ]
-
-            matches = self._merge_hybrid_matches(
-                vector_match_groups=vector_match_groups,
-                bm25_match_groups=bm25_match_groups,
-                top_k=top_k,
-                rrf_k=self.settings.rrf_k,
-            )
-        else:
-            matches = self._merge_matches(
-                match_groups=vector_match_groups,
-                top_k=top_k,
-            )
-
-        # Debug de matches seleccionados, ver en consola en la que lanzamos la API
-
-        print("\n" + "=" * 80, flush=True)
-        
-        print("[HYBRID DEBUG] retrieval_queries:", flush=True)
-        for index, query in enumerate(retrieval_queries, start=1):
-            print(f"  {index}. {query!r}", flush=True)
-
-        if self.settings.hybrid_search_enabled:
-            print("[HYBRID DEBUG] bm25_queries:", flush=True)
-            for index, query in enumerate(bm25_queries, start=1):
-                print(f"  {index}. {query!r}", flush=True)
-
-        print("[HYBRID DEBUG] selected matches:", flush=True)
-        for index, match in enumerate(matches, start=1):
-            print(
-                {
-                    "rank": index,
-                    "source": match.get("source"),
-                    "page": f"{match.get('page_start')}-{match.get('page_end')}",
-                    "chunk_index": match.get("chunk_index"),
-                    "_distance": match.get("_distance"),
-                    "_vector_score": match.get("_vector_score"),
-                    "_bm25_raw_score": match.get("_bm25_raw_score"),
-                    "_bm25_score": match.get("_bm25_score"),
-                    "_vector_rank": match.get("_vector_rank"),
-                    "_bm25_rank": match.get("_bm25_rank"),
-                    "_rrf_score": match.get("_rrf_score"),
-                    "_retrieval_sources": match.get("_retrieval_sources"),
-                },
-                flush=True,
-            )
-        print("=" * 80 + "\n", flush=True)
-
-        # Fin debug
-
-        context_blocks = []
-        citations = []
-        source_options = []
+        context_blocks: list[str] = []
+        citations: list[dict[str, Any]] = []
+        source_options: list[dict[str, Any]] = []
         for index, match in enumerate(matches, start=1):
             source_id = f"S{index}"
-            source = match["source"]
-            page_start = match["page_start"]
-            page_end = match["page_end"]
-            page_label = self._page_label(page_start, page_end)
-            context_blocks.append(f"[{source_id}] {source} {page_label}\n{match['text']}")
+            page = int(match["page_start"])
+            context_blocks.append(
+                f"[{source_id}] {match['source']} p.{page}\n{match['text']}"
+            )
             citations.append(self._citation_from_match(match, source_id))
             source_options.append(self._source_option_from_match(match, source_id))
-
         return {
             "context_blocks": context_blocks,
             "citations": citations,
@@ -558,8 +440,7 @@ class RagPipeline:
         tag: str | None = None,
         enable_reasoning: bool = False,
     ) -> dict[str, Any]:
-        """Responde una pregunta usando retrieval + generación no streaming."""
-        generation_inputs = self._prepare_generation_inputs(question, top_k=top_k, messages=messages, tag=tag)
+        inputs = self._prepare_generation_inputs(question, top_k, messages, tag)
         with self.coordinator.acquire(
             "chat",
             workload="query",
@@ -569,16 +450,12 @@ class RagPipeline:
             try:
                 generation = self.client.generate_answer(
                     question,
-                    generation_inputs["context_blocks"],
+                    inputs["context_blocks"],
                     messages=messages,
                     enable_reasoning=enable_reasoning,
                 )
-                # La auditoría comparte exactamente la misma carga de chat.
                 citations = self._select_used_citations(
-                    question=question,
-                    answer=generation["answer"],
-                    generation_inputs=generation_inputs,
-                    messages=messages,
+                    question, generation["answer"], inputs, messages
                 )
             finally:
                 if self.supervisor is not None:
@@ -587,7 +464,7 @@ class RagPipeline:
             "answer": generation["answer"],
             "reasoning": generation["reasoning"],
             "citations": citations,
-            "matches": generation_inputs["matches"],
+            "matches": inputs["matches"],
         }
 
     def stream_answer(
@@ -598,31 +475,30 @@ class RagPipeline:
         tag: str | None = None,
         enable_reasoning: bool = False,
     ) -> dict[str, Any]:
-        """Responde una pregunta en streaming."""
-        generation_inputs = self._prepare_generation_inputs(question, top_k=top_k, messages=messages, tag=tag)
-        chat_lease = self.coordinator.acquire(
+        inputs = self._prepare_generation_inputs(question, top_k, messages, tag)
+        lease = self.coordinator.acquire(
             "chat",
             workload="query",
             timeout=self.settings.model_request_timeout,
         )
         try:
             self._ensure_models(("chat",))
-            primary_stream = self.client.stream_answer(
+            primary = self.client.stream_answer(
                 question,
-                generation_inputs["context_blocks"],
+                inputs["context_blocks"],
                 messages=messages,
                 enable_reasoning=enable_reasoning,
             )
         except BaseException:
-            chat_lease.release()
+            lease.release()
             raise
 
-        cleanup_lock = threading.Lock()
+        lock = threading.Lock()
         cleaned = False
 
         def cleanup() -> None:
             nonlocal cleaned
-            with cleanup_lock:
+            with lock:
                 if cleaned:
                     return
                 cleaned = True
@@ -630,44 +506,37 @@ class RagPipeline:
                     if self.supervisor is not None:
                         self.supervisor.schedule_idle_stop("chat")
                 finally:
-                    chat_lease.release()
+                    lease.release()
 
-        def guarded_stream(stream):
+        def guarded(stream):
             completed = False
             try:
-                for event in stream:
-                    yield event
+                yield from stream
                 completed = True
             finally:
-                # En flujo normal se conserva el lease hasta auditar las citas.
-                # Un cierre/una excepción prematuros lo libera inmediatamente.
                 if not completed:
                     cleanup()
 
         def fallback_stream():
-            stream = self.client.stream_answer(
-                question,
-                generation_inputs["context_blocks"],
-                messages=messages,
-                enable_reasoning=False,
+            return guarded(
+                self.client.stream_answer(
+                    question,
+                    inputs["context_blocks"],
+                    messages=messages,
+                    enable_reasoning=False,
+                )
             )
-            return guarded_stream(stream)
 
         def resolve_citations(answer: str) -> list[dict[str, Any]]:
             try:
-                return self._select_used_citations(
-                    question=question,
-                    answer=answer,
-                    generation_inputs=generation_inputs,
-                    messages=messages,
-                )
+                return self._select_used_citations(question, answer, inputs, messages)
             finally:
                 cleanup()
 
         return {
-            "answer_stream": guarded_stream(primary_stream),
+            "answer_stream": guarded(primary),
             "fallback_stream": fallback_stream,
             "resolve_citations": resolve_citations,
             "close": cleanup,
-            "matches": generation_inputs["matches"],
+            "matches": inputs["matches"],
         }

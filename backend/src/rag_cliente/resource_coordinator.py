@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Literal
 
-ResourceName = Literal["parser_bundle", "embeddings", "chat"]
+ResourceName = Literal["embeddings", "chat"]
 WorkloadName = Literal["index", "query"]
 
 
@@ -77,7 +77,7 @@ class ResourceCoordinator:
     evitar un bloqueo entre el parser y embeddings.
     """
 
-    _VALID_RESOURCES = {"parser_bundle", "embeddings", "chat"}
+    _VALID_RESOURCES = {"embeddings", "chat"}
 
     def __init__(self) -> None:
         self._condition = threading.Condition(threading.RLock())

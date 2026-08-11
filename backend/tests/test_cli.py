@@ -21,7 +21,6 @@ class CliStreamingTests(unittest.TestCase):
             "page_start": 22,
             "page_end": 22,
             "chunk_index": 76,
-            "ocr_used": False,
             "source_path": "data/pdfs/guia.pdf",
         }
 

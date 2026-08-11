@@ -154,4 +154,10 @@ class BM25Store:
         if not any(tokenized_corpus):
             return None
 
-        return BM25Okapi(tokenized_corpus)
+        # In small corpora with very similar pages (for example, consecutive
+        # pages of one table), rank_bm25's default epsilon can inherit a
+        # negative average IDF. Common table terms then outweigh an exact rare
+        # identifier and every result is filtered as non-positive. Zeroing the
+        # IDF of over-frequent terms keeps distinctive terms useful without
+        # rewarding boilerplate shared by most pages.
+        return BM25Okapi(tokenized_corpus, epsilon=0.0)

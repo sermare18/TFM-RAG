@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 
 
 def incompatible_index_message(found: object = "desconocida") -> str:

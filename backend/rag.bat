@@ -24,7 +24,6 @@ if /I "%COMMAND%"=="test" goto :test
 if /I "%COMMAND%"=="gpu" goto :gpu
 if /I "%COMMAND%"=="doctor" goto :doctor
 if /I "%COMMAND%"=="models" goto :models
-if /I "%COMMAND%"=="smoke-parser" goto :smoke_parser
 goto :help
 
 :api
@@ -61,7 +60,7 @@ conda run --no-capture-output -n "%ENV_NAME%" python -m unittest discover -s tes
 exit /b %ERRORLEVEL%
 
 :gpu
-conda run --no-capture-output -n "%ENV_NAME%" python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA disponible:', torch.cuda.is_available()); print('CUDA runtime:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NINGUNA')"
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 exit /b %ERRORLEVEL%
 
 :doctor
@@ -76,14 +75,6 @@ if "%~2"=="" (
 conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli models %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %ERRORLEVEL%
 
-:smoke_parser
-if "%~2"=="" (
-    echo Uso: rag.bat smoke-parser ^<pdf^> --profile ^<perfil^> --pages ^<rango^>
-    exit /b 1
-)
-conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli smoke-parser %FORWARD_ARGS%
-exit /b %ERRORLEVEL%
-
 :help
 echo Uso: rag.bat ^<comando^> [argumento]
 echo.
@@ -92,11 +83,10 @@ echo   index [carpeta]    Indexa documentos; admite --tag despues de la carpeta
 echo   ask [opciones]     Consulta el RAG; admite todas las opciones del CLI
 echo   viewer             Abre el visor de LanceDB
 echo   test               Ejecuta los tests
-echo   gpu                Comprueba PyTorch y CUDA
-echo   doctor             Valida hardware, llama.cpp, disco y configuracion sin arrancar modelos
+echo   gpu                Muestra la GPU NVIDIA mediante nvidia-smi
+echo   doctor             Valida Bedrock, llama.cpp, disco y modelos sin arrancarlos
 echo   models plan cpu    Muestra el plan local de modelos CPU sin descargar
 echo   models plan gpu    Muestra el plan local de modelos GPU sin descargar
 echo   models download cpu/gpu  Descarga solo al solicitarlo explicitamente
-echo   models check       Valida GGUF, mmproj y rutas sin cargar modelos
-echo   smoke-parser PDF --profile PERFIL --pages RANGO  Diagnostico manual acotado en JSON
+echo   models check       Valida los GGUF locales sin cargar modelos
 exit /b 0

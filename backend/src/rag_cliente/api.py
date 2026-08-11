@@ -22,10 +22,8 @@ from pydantic import BaseModel, Field
 
 from rag_cliente.config import get_settings
 from rag_cliente.pipeline import RagPipeline
-from rag_cliente.pdf_loader import SUPPORTED_DOCUMENT_SUFFIXES
+from rag_cliente.bedrock_parser import SUPPORTED_DOCUMENT_SUFFIXES
 
-# Reutilizo una única lista para que la API y el indexador acepten exactamente
-# los mismos formatos cuando yo amplíe los proveedores de Marker.
 DOCUMENT_SUFFIXES = SUPPORTED_DOCUMENT_SUFFIXES
 
 
@@ -41,6 +39,7 @@ class IndexRequest(BaseModel):
 
     doc_dir: str = Field(..., description="Directory containing supported document files.")
     tag: str | None = Field(default=None, description="Optional metadata tag assigned to indexed chunks.")
+    refresh_bedrock: bool = Field(default=False)
 
 
 class IndexResponse(BaseModel):
@@ -70,8 +69,6 @@ class Citation(BaseModel):
     source_id: str | None = None
     chunk_id: str | None = None
     document_id: str
-    kind: str | None = None
-    table_id: str | None = None
     source: str
     source_path: str
     source_type: str
@@ -79,7 +76,7 @@ class Citation(BaseModel):
     page_end: int
     source_pages: list[int] = Field(default_factory=list)
     chunk_index: int
-    ocr_used: bool = False
+    page_chunk_index: int = 0
     tag: str | None = None
 
 
@@ -332,7 +329,11 @@ def create_app() -> FastAPI:
         doc_dir = Path(payload.doc_dir)
         tag = (payload.tag or "").strip() or None
         try:
-            indexed_chunks = app.state.pipeline.index_documents(doc_dir, tag=tag)
+            indexed_chunks = app.state.pipeline.index_documents(
+                doc_dir,
+                tag=tag,
+                refresh_bedrock=payload.refresh_bedrock,
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
