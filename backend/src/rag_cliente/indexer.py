@@ -1,392 +1,613 @@
-"""Chunking de documentos para indexación vectorial.
+"""Chunking documental estructurado y consciente de procedencia.
 
-Este módulo toma `PageDocument` ya cargados y los transforma en `ChunkRecord`,
-que es la estructura que luego se embebe y se guarda en la base vectorial.
-
-Decisiones principales:
-- El chunking se hace por página lógica, no cruzando páginas.
-- El texto normal se divide con `RecursiveCharacterTextSplitter` de LangChain.
-- Las tablas Markdown se separan del texto normal y se trocean por filas
-  completas, repitiendo la cabecera en cada fragmento de tabla.
-- Las tablas Markdown se compactan antes de medir tamaño para evitar que el
-  padding visual de Marker genere chunks artificialmente pequeños.
-- Las filas vacías reales de una tabla se consumen como parte de la tabla, pero
-  no generan chunks.
-- Se conservan metadatos de trazabilidad: archivo, página, índice de chunk y uso de OCR.
-
-Limitaciones:
-- El nombre `PdfChunker` es más estrecho de lo que realmente hace, porque también
-  procesa DOCX y TXT.
-- Al trocear página por página se simplifican las citas, pero se puede romper el
-  contexto cuando una idea continúa entre dos páginas.
-- `chunk_index` es global dentro de una ejecución de chunking; no se reinicia por
-  documento.
-- Si una fila de tabla es más grande que `CHUNK_SIZE`, se conserva completa en un
-  único chunk aunque supere ese tamaño, para no partir datos de una misma fila.
+El chunker consume exclusivamente los tipos publicados por Marker. Solo trata
+como tabla un elemento que Marker ya haya clasificado como ``Table`` o
+``TableOfContents``; nunca reclasifica texto ni une ``Table + Text``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import html as html_lib
+import json
 import re
 from dataclasses import dataclass
-from uuid import uuid4
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from html.parser import HTMLParser
+from typing import Any, Iterable
 
 from rag_cliente.config import Settings
-from rag_cliente.pdf_loader import PageDocument
+from rag_cliente.index_schema import INDEX_SCHEMA_VERSION
+from rag_cliente.pdf_loader import (
+    DocumentElement,
+    PageDocument,
+    ParsedDocument,
+    parsed_documents_from_pages,
+)
 
-_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", flags=re.UNICODE)
+_TABLE_KINDS = {"table", "tableofcontents"}
+_CONTAINER_KINDS = {"document", "page"}
+_HEADING_KINDS = {"sectionheader", "title", "heading"}
 
 
 @dataclass(slots=True)
 class ChunkRecord:
-    """Representa un chunk listo para ser indexado en el vector store."""
+    """Chunk persistible con identidad determinista y procedencia completa."""
 
     id: str
+    chunk_id: str
     document_id: str
+    kind: str
     text: str
+    html: str
     source: str
     source_path: str
     source_type: str
+    section_path: list[str]
     page_start: int
     page_end: int
+    source_pages: list[int]
+    source_spans: list[dict[str, Any]]
+    source_block_ids: list[str]
+    table_id: str | None
+    token_count: int
+    oversize: bool
+    parser_profile: str
+    marker_version: str
+    provenance: str
+    schema_version: int
     chunk_index: int
     ocr_used: bool
     tag: str = ""
+    metadata: dict[str, Any] | None = None
 
 
-def _split_markdown_cells(line: str) -> list[str]:
-    """Divide una fila Markdown en celdas, con o sin pipes externos."""
-    stripped = line.strip()
-    if "|" not in stripped:
+@dataclass(frozen=True, slots=True)
+class _TableCell:
+    text: str
+    is_header: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TableRow:
+    cells: tuple[_TableCell, ...]
+    html: str
+    is_header: bool
+
+
+class _MarkerTableHTMLParser(HTMLParser):
+    """Lee filas/celdas del HTML de un bloque ya clasificado por Marker."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.rows: list[_TableRow] = []
+        self.table_open_tag = "<table>"
+        self._table_depth = 0
+        self._thead_depth = 0
+        self._row_html: list[str] | None = None
+        self._row_cells: list[_TableCell] = []
+        self._row_in_thead = False
+        self._cell_tag: str | None = None
+        self._cell_text: list[str] = []
+
+    def _append_raw(self, value: str) -> None:
+        if self._row_html is not None:
+            self._row_html.append(value)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        normalized = tag.lower()
+        raw = self.get_starttag_text() or f"<{tag}>"
+
+        if normalized == "table":
+            if self._table_depth == 0:
+                self.table_open_tag = raw
+            else:
+                self._append_raw(raw)
+            self._table_depth += 1
+            return
+        if self._table_depth == 0:
+            return
+
+        if normalized == "thead":
+            self._thead_depth += 1
+            self._append_raw(raw)
+            return
+        if normalized == "tr" and self._row_html is None:
+            self._row_html = [raw]
+            self._row_cells = []
+            self._row_in_thead = self._thead_depth > 0
+            return
+
+        self._append_raw(raw)
+        if normalized in {"th", "td"} and self._row_html is not None:
+            self._cell_tag = normalized
+            self._cell_text = []
+        elif normalized == "br" and self._cell_tag is not None:
+            self._cell_text.append("\n")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in {"br", "img", "hr", "meta", "link", "input"}:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if self._table_depth == 0:
+            return
+
+        if normalized in {"th", "td"} and self._cell_tag == normalized:
+            self._append_raw(f"</{tag}>")
+            text = html_lib.unescape("".join(self._cell_text))
+            text = re.sub(r"[ \t\r\f\v]+", " ", text)
+            text = re.sub(r"\n+", "<br>", text).strip()
+            self._row_cells.append(
+                _TableCell(
+                    text=text,
+                    is_header=normalized == "th" or self._row_in_thead,
+                )
+            )
+            self._cell_tag = None
+            self._cell_text = []
+            return
+
+        if normalized == "tr" and self._row_html is not None:
+            self._append_raw(f"</{tag}>")
+            if self._row_cells:
+                self.rows.append(
+                    _TableRow(
+                        cells=tuple(self._row_cells),
+                        html="".join(self._row_html),
+                        is_header=(
+                            self._row_in_thead
+                            or any(cell.is_header for cell in self._row_cells)
+                        ),
+                    )
+                )
+            self._row_html = None
+            self._row_cells = []
+            self._row_in_thead = False
+            return
+
+        if normalized == "thead":
+            self._append_raw(f"</{tag}>")
+            self._thead_depth = max(0, self._thead_depth - 1)
+            return
+        if normalized == "table":
+            if self._table_depth > 1:
+                self._append_raw(f"</{tag}>")
+            self._table_depth = max(0, self._table_depth - 1)
+            return
+
+        self._append_raw(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        self._append_raw(data)
+        if self._cell_tag is not None:
+            self._cell_text.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        value = f"&{name};"
+        self._append_raw(value)
+        if self._cell_tag is not None:
+            self._cell_text.append(value)
+
+    def handle_charref(self, name: str) -> None:
+        value = f"&#{name};"
+        self._append_raw(value)
+        if self._cell_tag is not None:
+            self._cell_text.append(value)
+
+
+def estimate_token_count(text: str) -> int:
+    """Estimación offline determinista; no carga ningún tokenizador/modelo."""
+    return len(_TOKEN_PATTERN.findall(text or ""))
+
+
+def _unique_strings(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _unique_ints(values: Iterable[int]) -> list[int]:
+    return sorted({int(value) for value in values})
+
+
+def _unique_spans(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        plain = dict(value)
+        key = json.dumps(plain, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(plain)
+    return result
+
+
+def _iter_chunkable_elements(element: DocumentElement) -> Iterable[DocumentElement]:
+    kind = element.kind.strip().lower()
+    if kind in _CONTAINER_KINDS and element.children:
+        for child in element.children:
+            yield from _iter_chunkable_elements(child)
+        return
+    yield element
+
+
+def _row_to_markdown(row: _TableRow) -> str:
+    cells = [cell.text.replace("|", r"\|").strip() for cell in row.cells]
+    return "| " + " | ".join(cells) + " |"
+
+
+def _table_text(header_rows: list[_TableRow], body_rows: list[_TableRow]) -> str:
+    lines = [_row_to_markdown(row) for row in header_rows]
+    if header_rows:
+        column_count = max(len(row.cells) for row in header_rows)
+        lines.append("| " + " | ".join("---" for _ in range(column_count)) + " |")
+    lines.extend(_row_to_markdown(row) for row in body_rows)
+    return "\n".join(lines).strip()
+
+
+def _table_html(
+    opening_tag: str,
+    header_rows: list[_TableRow],
+    body_rows: list[_TableRow],
+) -> str:
+    rows = [*header_rows, *body_rows]
+    return opening_tag + "".join(row.html for row in rows) + "</table>"
+
+
+def _split_text_window(text: str, window: int, overlap: int) -> list[str]:
+    matches = list(_TOKEN_PATTERN.finditer(text))
+    if not matches:
         return []
-    return [cell.strip() for cell in stripped.strip("|").split("|")]
+    if len(matches) <= window:
+        return [text.strip()]
 
-
-def _is_markdown_table_separator(line: str) -> bool:
-    """Detecta la línea separadora típica de una tabla Markdown."""
-    cells = _split_markdown_cells(line)
-    return len(cells) >= 2 and all(_TABLE_SEPARATOR_CELL_RE.match(cell) for cell in cells)
-
-
-def _is_empty_markdown_table_row(line: str) -> bool:
-    """Detecta filas de tabla Markdown completamente vacías.
-
-    Ejemplo:
-
-    `|     |     |     |`
-
-    Estas filas pueden existir visualmente en el PDF, pero no aportan contenido
-    semántico al RAG. Las consumimos dentro de la tabla para que no se conviertan
-    en chunks basura.
-    """
-    cells = _split_markdown_cells(line)
-    return len(cells) >= 2 and all(not cell.strip() for cell in cells)
-
-
-def _is_markdown_table_row(line: str) -> bool:
-    """Detecta filas Markdown con dos o más columnas y algo de contenido."""
-    cells = _split_markdown_cells(line)
-    return len(cells) >= 2 and any(cell.strip() for cell in cells)
-
-
-def _is_markdown_table_continuation_line(line: str) -> bool:
-    """Detecta líneas que deben seguir dentro de una tabla ya iniciada."""
-    return _is_markdown_table_row(line) or _is_empty_markdown_table_row(line)
-
-
-def _normalize_table_cell(cell: str) -> str:
-    """Compacta una celda de tabla Markdown sin destruir contenido útil.
-
-    Marker puede devolver tablas con padding visual para alinear columnas.
-    Ese padding infla artificialmente el tamaño de los chunks. Compactamos
-    espacios y tabuladores, pero preservamos contenido como `<br>`.
-    """
-    return re.sub(r"[ \t]+", " ", cell.strip())
-
-
-def _build_compact_markdown_row(cells: list[str]) -> str:
-    """Reconstruye una fila Markdown sin padding visual innecesario."""
-    normalized_cells = [_normalize_table_cell(cell) for cell in cells]
-    return "| " + " | ".join(normalized_cells) + " |"
-
-
-def _build_compact_separator(column_count: int) -> str:
-    """Construye un separador Markdown mínimo para N columnas."""
-    return "| " + " | ".join("---" for _ in range(column_count)) + " |"
-
-
-def _compact_markdown_table(table: str) -> str:
-    """Elimina padding visual y filas vacías de tablas Markdown generadas por Marker.
-
-    Marker puede devolver líneas con cientos de espacios para alinear columnas:
-
-    `| Descripción                                                                                                                                 |`
-
-    Si medimos esa tabla con `len()`, el chunker cree que ocupa mucho más de lo
-    que realmente ocupa semánticamente.
-
-    También puede devolver filas completamente vacías:
-
-    `|     |     |     |`
-
-    Esas filas no aportan contenido al índice, así que se descartan.
-    """
-    compact_lines: list[str] = []
-    table_lines = [line for line in table.splitlines() if line.strip()]
-
-    for line in table_lines:
-        cells = _split_markdown_cells(line)
-        if not cells:
-            continue
-
-        if _is_empty_markdown_table_row(line):
-            continue
-
-        if _is_markdown_table_separator(line):
-            if compact_lines:
-                compact_lines.append(_build_compact_separator(len(cells)))
-            continue
-
-        compact_lines.append(_build_compact_markdown_row(cells))
-
-    return "\n".join(compact_lines).strip()
-
-
-def _is_empty_table_noise(text: str) -> bool:
-    """Detecta chunks formados solo por filas vacías de tabla."""
-    lines = [line for line in text.splitlines() if line.strip()]
-    return bool(lines) and all(_is_empty_markdown_table_row(line) for line in lines)
-
-
-def _looks_like_markdown_table_start(lines: list[str], index: int) -> bool:
-    """Comprueba si `lines[index]` inicia una tabla Markdown."""
-    if index + 1 >= len(lines):
-        return False
-    return _is_markdown_table_row(lines[index]) and _is_markdown_table_separator(lines[index + 1])
-
-
-def _split_text_and_markdown_tables(text: str) -> list[tuple[str, str]]:
-    """Separa texto normal y tablas Markdown preservando el orden original.
-
-    Devuelve una lista de pares `(kind, content)`, donde `kind` es `"text"` o
-    `"table"`.
-
-    Solo separa tablas Markdown bien formadas con cabecera y línea separadora.
-    Las filas vacías que aparezcan dentro de la tabla se consumen como parte de
-    esa tabla para evitar que salgan como chunks independientes.
-    """
-    lines = text.splitlines()
-    segments: list[tuple[str, str]] = []
-    text_buffer: list[str] = []
-    index = 0
-
-    def flush_text_buffer() -> None:
-        nonlocal text_buffer
-        content = "\n".join(text_buffer).strip()
-        if content and not _is_empty_table_noise(content):
-            segments.append(("text", content))
-        text_buffer = []
-
-    while index < len(lines):
-        if _looks_like_markdown_table_start(lines, index):
-            flush_text_buffer()
-
-            table_lines = [lines[index].rstrip(), lines[index + 1].rstrip()]
-            index += 2
-
-            while index < len(lines):
-                line = lines[index]
-
-                if _is_markdown_table_continuation_line(line):
-                    table_lines.append(line.rstrip())
-                    index += 1
-                    continue
-
-                break
-
-            compact_table = _compact_markdown_table("\n".join(table_lines))
-            if compact_table:
-                segments.append(("table", compact_table))
-            continue
-
-        text_buffer.append(lines[index].rstrip())
-        index += 1
-
-    flush_text_buffer()
-    return segments
-
-
-def _split_markdown_table_rows(table: str) -> tuple[str, str, list[str]] | None:
-    """Extrae cabecera, separador y filas de una tabla Markdown."""
-    lines = [line.rstrip() for line in table.splitlines() if line.strip()]
-    if len(lines) < 2:
-        return None
-
-    header = lines[0]
-    separator = lines[1]
-
-    if not _is_markdown_table_row(header) or not _is_markdown_table_separator(separator):
-        return None
-
-    rows = [
-        line
-        for line in lines[2:]
-        if _is_markdown_table_row(line) and not _is_empty_markdown_table_row(line)
-    ]
-
-    return header, separator, rows
+    chunks: list[str] = []
+    start = 0
+    while start < len(matches):
+        end = min(start + window, len(matches))
+        char_start = matches[start].start()
+        char_end = matches[end - 1].end()
+        chunk = text[char_start:char_end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(matches):
+            break
+        start = max(start + 1, end - overlap)
+    return chunks
 
 
 class PdfChunker:
-    """Divide texto cargado desde documentos en chunks pequeños y solapados.
-
-    Aunque el nombre sugiere PDF, esta clase no procesa solo PDFs:
-    recibe una lista de `PageDocument`, por lo que también puede trocear
-    contenidos procedentes de DOCX y TXT.
-
-    Estrategia:
-    - Detecta tablas Markdown antes de aplicar el splitter genérico.
-    - Compacta tablas Markdown para eliminar padding visual.
-    - Descarta filas vacías de tablas.
-    - En tablas, genera chunks independientes por filas completas.
-    - Repite cabecera y separador de tabla en cada chunk.
-    - En texto normal, usa el splitter textual existente.
-    """
+    """Nombre público histórico para el chunker documental estructurado."""
 
     def __init__(self, settings: Settings) -> None:
-        """Inicializa el splitter con la configuración del proyecto."""
-        self.chunk_size = settings.chunk_size
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""],
+        self.target_tokens = settings.chunk_target_tokens
+        self.max_tokens = settings.chunk_max_tokens
+        self.overlap_tokens = settings.chunk_overlap_tokens
+        self.table_max_tokens = settings.table_chunk_max_tokens
+
+    @staticmethod
+    def _can_merge_text(previous: DocumentElement, current: DocumentElement) -> bool:
+        if current.kind.strip().lower() in _HEADING_KINDS:
+            return False
+        if previous.section_path != current.section_path:
+            return False
+        return previous.page_start <= current.page_start <= previous.page_end + 1
+
+    @staticmethod
+    def _ocr_used(document: ParsedDocument, source_pages: list[int]) -> bool:
+        usage = document.metadata.get("ocr_used_by_page", {})
+        if isinstance(usage, dict):
+            return any(bool(usage.get(str(page), usage.get(page, False))) for page in source_pages)
+        return False
+
+    @staticmethod
+    def _chunk_id(
+        document: ParsedDocument,
+        *,
+        kind: str,
+        text: str,
+        source_pages: list[int],
+        source_block_ids: list[str],
+        table_id: str | None,
+        document_ordinal: int,
+    ) -> str:
+        identity = {
+            "document_id": document.id,
+            "source_path": document.source_path,
+            "kind": kind,
+            "text": text,
+            "source_pages": source_pages,
+            "source_block_ids": source_block_ids,
+            "table_id": table_id,
+            "ordinal": document_ordinal,
+        }
+        canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _build_record(
+        self,
+        document: ParsedDocument,
+        elements: list[DocumentElement],
+        *,
+        kind: str,
+        text: str,
+        html: str,
+        table_id: str | None,
+        oversize: bool,
+        chunk_index: int,
+        document_ordinal: int,
+        tag: str,
+    ) -> ChunkRecord:
+        source_pages = _unique_ints(
+            page
+            for element in elements
+            for page in (
+                element.source_pages
+                or range(element.page_start, element.page_end + 1)
+            )
+        )
+        source_spans = _unique_spans(
+            span for element in elements for span in element.source_spans
+        )
+        source_block_ids = _unique_strings(
+            block_id
+            for element in elements
+            for block_id in ([element.id] if element.id else []) + element.source_block_ids
+        )
+        page_start = min(source_pages) if source_pages else min(element.page_start for element in elements)
+        page_end = max(source_pages) if source_pages else max(element.page_end for element in elements)
+        capabilities = document.metadata.get("capabilities", {})
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        marker_version = str(capabilities.get("marker_version") or "2.0.0")
+        parser_profile = str(document.metadata.get("parser_profile") or "unknown")
+        provenance_values = _unique_strings(element.provenance for element in elements)
+        provenance = "+".join(provenance_values) or "unknown"
+        section_path = list(elements[0].section_path) if elements else []
+        token_count = estimate_token_count(text)
+        chunk_id = self._chunk_id(
+            document,
+            kind=kind,
+            text=text,
+            source_pages=source_pages,
+            source_block_ids=source_block_ids,
+            table_id=table_id,
+            document_ordinal=document_ordinal,
+        )
+        return ChunkRecord(
+            id=chunk_id,
+            chunk_id=chunk_id,
+            document_id=document.id,
+            kind=kind,
+            text=text,
+            html=html,
+            source=document.source,
+            source_path=document.source_path,
+            source_type=document.source_type,
+            section_path=section_path,
+            page_start=page_start,
+            page_end=page_end,
+            source_pages=source_pages,
+            source_spans=source_spans,
+            source_block_ids=source_block_ids,
+            table_id=table_id,
+            token_count=token_count,
+            oversize=oversize,
+            parser_profile=parser_profile,
+            marker_version=marker_version,
+            provenance=provenance,
+            schema_version=INDEX_SCHEMA_VERSION,
+            chunk_index=chunk_index,
+            ocr_used=self._ocr_used(document, source_pages),
+            tag=tag,
+            metadata={
+                "capabilities": dict(capabilities),
+                "element_metadata": [dict(element.metadata) for element in elements],
+                "token_count_method": "offline_regex_estimate",
+            },
         )
 
-    def _split_regular_text(self, text: str) -> list[str]:
-        """Aplica el splitter existente al texto que no es tabla."""
-        chunks: list[str] = []
+    def _table_parts(
+        self,
+        element: DocumentElement,
+    ) -> list[tuple[str, str, bool]]:
+        parser = _MarkerTableHTMLParser()
+        try:
+            parser.feed(element.html)
+            parser.close()
+        except (ValueError, TypeError):
+            parser.rows = []
 
-        for chunk in self.splitter.split_text(text):
-            normalized = chunk.strip()
-            if not normalized:
-                continue
+        if not parser.rows:
+            text = element.text.strip()
+            if not text:
+                return []
+            return [
+                (
+                    text,
+                    element.html,
+                    estimate_token_count(text) > self.table_max_tokens,
+                )
+            ]
 
-            if _is_empty_table_noise(normalized):
-                continue
+        header_rows: list[_TableRow] = []
+        body_rows: list[_TableRow] = []
+        in_header = True
+        for row in parser.rows:
+            if in_header and row.is_header:
+                header_rows.append(row)
+            else:
+                in_header = False
+                body_rows.append(row)
 
-            chunks.append(normalized)
+        if not body_rows:
+            text = _table_text(header_rows, [])
+            return [
+                (
+                    text,
+                    _table_html(parser.table_open_tag, header_rows, []),
+                    estimate_token_count(text) > self.table_max_tokens,
+                )
+            ] if text else []
 
-        return chunks
-
-    def _split_markdown_table(self, table: str) -> list[str]:
-        """Trocea una tabla Markdown sin partir filas.
-
-        Cada chunk de tabla conserva la cabecera y la línea separadora, aunque
-        contenga solo una parte de las filas. Así una fila recuperada por RAG no
-        pierde el significado de sus columnas.
-        """
-        compact_table = _compact_markdown_table(table)
-
-        parsed_table = _split_markdown_table_rows(compact_table)
-        if parsed_table is None:
-            return self._split_regular_text(compact_table)
-
-        header, separator, rows = parsed_table
-        table_prefix = [header, separator]
-
-        if not rows:
-            return []
-
-        chunks: list[str] = []
-        current_rows: list[str] = []
-
-        def build_table_chunk(rows_to_include: list[str]) -> str:
-            return "\n".join([*table_prefix, *rows_to_include]).strip()
-
-        for row in rows:
-            if not current_rows:
-                current_rows.append(row)
-                continue
-
-            candidate = build_table_chunk([*current_rows, row])
-
-            if len(candidate) <= self.chunk_size:
-                current_rows.append(row)
-                continue
-
-            chunks.append(build_table_chunk(current_rows))
-            current_rows = [row]
+        parts: list[tuple[str, str, bool]] = []
+        current_rows: list[_TableRow] = []
+        for row in body_rows:
+            candidate_rows = [*current_rows, row]
+            candidate_text = _table_text(header_rows, candidate_rows)
+            if current_rows and estimate_token_count(candidate_text) > self.table_max_tokens:
+                current_text = _table_text(header_rows, current_rows)
+                parts.append(
+                    (
+                        current_text,
+                        _table_html(parser.table_open_tag, header_rows, current_rows),
+                        estimate_token_count(current_text) > self.table_max_tokens,
+                    )
+                )
+                current_rows = [row]
+                single_text = _table_text(header_rows, current_rows)
+                if estimate_token_count(single_text) > self.table_max_tokens:
+                    parts.append(
+                        (
+                            single_text,
+                            _table_html(parser.table_open_tag, header_rows, current_rows),
+                            True,
+                        )
+                    )
+                    current_rows = []
+            else:
+                current_rows = candidate_rows
 
         if current_rows:
-            chunks.append(build_table_chunk(current_rows))
+            text = _table_text(header_rows, current_rows)
+            parts.append(
+                (
+                    text,
+                    _table_html(parser.table_open_tag, header_rows, current_rows),
+                    estimate_token_count(text) > self.table_max_tokens,
+                )
+            )
+        return parts
 
-        return chunks
-
-    def _split_page_text(self, text: str) -> list[str]:
-        """Divide una página alternando texto normal y tablas Markdown."""
-        chunks: list[str] = []
-
-        for kind, content in _split_text_and_markdown_tables(text):
-            if kind == "table":
-                chunks.extend(self._split_markdown_table(content))
-            else:
-                chunks.extend(self._split_regular_text(content))
-
-        return chunks
-
-    def _build_chunk_record(
+    def chunk_documents(
         self,
-        page: PageDocument,
-        text: str,
-        chunk_index: int,
-        tag: str = "",
-    ) -> ChunkRecord:
-        """Crea un `ChunkRecord` preservando metadatos de origen."""
-        return ChunkRecord(
-            id=str(uuid4()),
-            document_id=page.document_id,
-            text=text,
-            source=page.source,
-            source_path=page.source_path,
-            source_type=page.source_type,
-            page_start=page.page_number,
-            page_end=page.page_number,
-            chunk_index=chunk_index,
-            ocr_used=page.ocr_used,
-            tag=tag,
-        )
-
-    def chunk_pages(self, pages: list[PageDocument], tag: str | None = None) -> list[ChunkRecord]:
-        """Convierte páginas/unidades cargadas en una lista de `ChunkRecord`.
-
-        Flujo:
-        1. Recorre cada `PageDocument`.
-        2. Separa tablas Markdown del texto normal.
-        3. Divide texto normal con el splitter configurado.
-        4. Divide tablas por filas completas, repitiendo cabecera.
-        5. Descarta filas vacías de tabla.
-        6. Descarta chunks vacíos.
-        7. Crea un `ChunkRecord` por cada fragmento válido.
-        """
+        documents: list[ParsedDocument],
+        tag: str | None = None,
+    ) -> list[ChunkRecord]:
         chunks: list[ChunkRecord] = []
-        chunk_index = 0
+        global_index = 0
         explicit_tag = (tag or "").strip() or None
 
-        for page in pages:
-            split_texts = self._split_page_text(page.text)
+        for document in documents:
+            document_ordinal = 0
+            pending: list[DocumentElement] = []
+            document_tag = explicit_tag or str(document.metadata.get("tag") or "").strip()
 
-            for text in split_texts:
-                normalized = text.strip()
-                if not normalized:
+            def emit(
+                elements: list[DocumentElement],
+                *,
+                kind: str,
+                text: str,
+                html: str = "",
+                table_id: str | None = None,
+                oversize: bool = False,
+            ) -> None:
+                nonlocal global_index, document_ordinal
+                if not text.strip():
+                    return
+                chunks.append(
+                    self._build_record(
+                        document,
+                        elements,
+                        kind=kind,
+                        text=text.strip(),
+                        html=html.strip(),
+                        table_id=table_id,
+                        oversize=oversize,
+                        chunk_index=global_index,
+                        document_ordinal=document_ordinal,
+                        tag=document_tag,
+                    )
+                )
+                global_index += 1
+                document_ordinal += 1
+
+            def flush_pending() -> None:
+                nonlocal pending
+                if not pending:
+                    return
+                text = "\n\n".join(element.text.strip() for element in pending if element.text.strip())
+                html = "\n".join(element.html.strip() for element in pending if element.html.strip())
+                if estimate_token_count(text) <= self.max_tokens:
+                    emit(pending, kind="text", text=text, html=html)
+                else:
+                    for part in _split_text_window(
+                        text,
+                        window=min(self.target_tokens, self.max_tokens),
+                        overlap=min(self.overlap_tokens, self.max_tokens - 1),
+                    ):
+                        emit(
+                            pending,
+                            kind="text",
+                            text=part,
+                            html=html,
+                            oversize=estimate_token_count(part) > self.max_tokens,
+                        )
+                pending = []
+
+            logical_elements = [
+                item
+                for root in document.elements
+                for item in _iter_chunkable_elements(root)
+            ]
+            for element in logical_elements:
+                normalized_kind = element.kind.strip().lower()
+                if normalized_kind in _TABLE_KINDS:
+                    flush_pending()
+                    table_id = element.table_id or element.id or None
+                    for table_text, table_html, oversize in self._table_parts(element):
+                        emit(
+                            [element],
+                            kind="table",
+                            text=table_text,
+                            html=table_html,
+                            table_id=table_id,
+                            oversize=oversize,
+                        )
                     continue
 
-                if _is_empty_table_noise(normalized):
+                if not element.text.strip():
                     continue
+                if pending and not self._can_merge_text(pending[-1], element):
+                    flush_pending()
+                if pending:
+                    candidate = "\n\n".join(
+                        [*(item.text.strip() for item in pending), element.text.strip()]
+                    )
+                    if estimate_token_count(candidate) > self.max_tokens:
+                        flush_pending()
+                pending.append(element)
 
-                chunk_tag = explicit_tag if explicit_tag is not None else (page.tag or "").strip()
-                chunks.append(self._build_chunk_record(page, normalized, chunk_index, tag=chunk_tag))
-                chunk_index += 1
+            flush_pending()
 
         return chunks
+
+    def chunk_pages(
+        self,
+        pages: list[PageDocument],
+        tag: str | None = None,
+    ) -> list[ChunkRecord]:
+        """Compatibilidad pública: agrupa páginas y aplica chunking documental."""
+        return self.chunk_documents(parsed_documents_from_pages(pages), tag=tag)

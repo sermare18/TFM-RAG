@@ -93,6 +93,12 @@ class DocumentElement:
     polygon: list[list[float]] = field(default_factory=list)
     confidence: float | None = None
     children: list["DocumentElement"] = field(default_factory=list)
+    document_id: str = ""
+    parent_id: str | None = None
+    table_id: str | None = None
+    section_path: list[str] = field(default_factory=list)
+    provenance: str = "marker"
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +115,12 @@ class DocumentElement:
             "polygon": [list(point) for point in self.polygon],
             "confidence": self.confidence,
             "children": [child.as_dict() for child in self.children],
+            "document_id": self.document_id,
+            "parent_id": self.parent_id,
+            "table_id": self.table_id,
+            "section_path": list(self.section_path),
+            "provenance": self.provenance,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -174,6 +186,8 @@ class PageDocument:
     source_spans: list[dict[str, Any]] = field(default_factory=list)
     confidence: float | None = None
     extraction_metadata: dict[str, Any] = field(default_factory=dict)
+    provenance: str = "marker"
+    parser_profile: str = ""
 
     def __post_init__(self) -> None:
         if self.page_start is None:
@@ -192,6 +206,37 @@ def _emit(progress_callback: ProgressCallback | None, message: str) -> None:
 def _normalize_text(text: str) -> str:
     """Normaliza bloques de texto preservando separación por párrafos."""
     return "\n\n".join(block.strip() for block in text.split("\n\n") if block.strip()).strip()
+
+
+def _section_path_from_block(
+    block: dict[str, Any],
+    inherited: list[str] | None = None,
+) -> list[str]:
+    """Conserva la ruta de sección publicada por Marker sin inferirla del texto."""
+    raw_path = block.get("section_path")
+    if isinstance(raw_path, list):
+        path = [str(item).strip() for item in raw_path if str(item).strip()]
+        if path:
+            return path
+
+    hierarchy = _to_plain_data(block.get("section_hierarchy") or {})
+    if isinstance(hierarchy, dict) and hierarchy:
+        def sort_key(item: tuple[Any, Any]) -> tuple[int, str]:
+            key = str(item[0])
+            try:
+                return int(key), key
+            except ValueError:
+                return 10_000, key
+
+        path = [
+            str(value).strip()
+            for _, value in sorted(hierarchy.items(), key=sort_key)
+            if str(value).strip()
+        ]
+        if path:
+            return path
+
+    return list(inherited or [])
 
 
 def _extract_docx_text(document: Document) -> str:
@@ -380,6 +425,8 @@ def _load_native_pdf_pages(pdf_path: Path) -> list[PageDocument]:
                     page_number=page_index + 1,
                     text=_normalize_text(text),
                     ocr_used=False,
+                    provenance="pymupdf",
+                    parser_profile="native-pdf",
                 )
             )
     return pages
@@ -703,6 +750,9 @@ def _normalize_marker_element(
     block: dict[str, Any],
     *,
     inherited_page: int | None = None,
+    parent_id: str | None = None,
+    inherited_section_path: list[str] | None = None,
+    inherited_table_id: str | None = None,
     reading_order: list[int] | None = None,
 ) -> DocumentElement:
     """Propaga solo procedencia observable en el JSON oficial de Marker."""
@@ -711,6 +761,13 @@ def _normalize_marker_element(
     block_id = str(block.get("id") or "")
     page_number = _block_page_number(block, inherited_page)
     polygon = _marker_polygon(block)
+    section_path = _section_path_from_block(block, inherited_section_path)
+    normalized_kind = kind.strip().lower()
+    table_id = (
+        str(block.get("table_id") or block_id or "").strip() or None
+        if normalized_kind in {"table", "tableofcontents"}
+        else inherited_table_id
+    )
 
     own_span: list[dict[str, Any]] = []
     if block_id and kind.lower() not in {"document", "page"}:
@@ -733,6 +790,9 @@ def _normalize_marker_element(
                     _normalize_marker_element(
                         child,
                         inherited_page=page_number,
+                        parent_id=block_id or parent_id,
+                        inherited_section_path=section_path,
+                        inherited_table_id=table_id,
                         reading_order=counter,
                     )
                 )
@@ -774,6 +834,15 @@ def _normalize_marker_element(
         polygon=polygon,
         confidence=_marker_confidence(block, kind),
         children=children,
+        parent_id=parent_id,
+        table_id=table_id,
+        section_path=section_path,
+        provenance="marker",
+        metadata=(
+            dict(_to_plain_data(block.get("metadata")))
+            if isinstance(_to_plain_data(block.get("metadata")), dict)
+            else {}
+        ),
     )
 
 
@@ -947,6 +1016,7 @@ def _marker_document_pages(
         structured_chunks = _extract_marker_structured_chunks(rendered, metadata)
 
     pages: list[PageDocument] = []
+    parser_profile = resolve_marker_profile(settings).name
     for chunk in structured_chunks:
         page_number = int(chunk["page"])
         text = str(chunk["text"])
@@ -985,14 +1055,42 @@ def _marker_document_pages(
                 ],
                 confidence=chunk.get("confidence"),
                 extraction_metadata=chunk["extraction_metadata"],
+                provenance="marker",
+                parser_profile=parser_profile,
             )
         )
     return pages
 
 
-def _document_element_from_mapping(value: dict[str, Any]) -> DocumentElement:
+def _document_element_from_mapping(
+    value: dict[str, Any],
+    *,
+    document_id: str,
+    parent_id: str | None = None,
+    inherited_table_id: str | None = None,
+    inherited_section_path: list[str] | None = None,
+) -> DocumentElement:
+    kind = str(value.get("kind") or value.get("block_type") or "Unknown")
+    element_id = str(value.get("id") or "")
+    normalized_kind = kind.strip().lower()
+    table_id = (
+        str(value.get("table_id") or element_id or "").strip() or None
+        if normalized_kind in {"table", "tableofcontents"}
+        else inherited_table_id
+    )
+    section_path = [
+        str(item)
+        for item in value.get("section_path", inherited_section_path or [])
+        if str(item).strip()
+    ]
     children = [
-        _document_element_from_mapping(child)
+        _document_element_from_mapping(
+            child,
+            document_id=document_id,
+            parent_id=element_id or parent_id,
+            inherited_table_id=table_id,
+            inherited_section_path=section_path,
+        )
         for child in value.get("children", [])
         if isinstance(child, dict)
     ]
@@ -1000,8 +1098,8 @@ def _document_element_from_mapping(value: dict[str, Any]) -> DocumentElement:
     page_end = int(value.get("page_end", page_start))
     polygon = value.get("polygon", [])
     return DocumentElement(
-        id=str(value.get("id") or ""),
-        kind=str(value.get("kind") or value.get("block_type") or "Unknown"),
+        id=element_id,
+        kind=kind,
         html=str(value.get("html") or ""),
         text=str(value.get("text") or ""),
         page_start=page_start,
@@ -1013,6 +1111,16 @@ def _document_element_from_mapping(value: dict[str, Any]) -> DocumentElement:
         polygon=[list(point) for point in polygon if isinstance(point, (list, tuple))],
         confidence=value.get("confidence"),
         children=children,
+        document_id=document_id,
+        parent_id=(
+            str(value.get("parent_id")).strip()
+            if value.get("parent_id") is not None
+            else parent_id
+        ),
+        table_id=table_id,
+        section_path=section_path,
+        provenance=str(value.get("provenance") or "marker"),
+        metadata=dict(value.get("metadata") or {}),
     )
 
 
@@ -1033,15 +1141,47 @@ def parsed_document_from_pages(path: Path, pages: list[PageDocument]) -> ParsedD
             polygon=[list(point) for point in page.polygon],
             confidence=page.confidence,
             children=[
-                _document_element_from_mapping(child)
+                _document_element_from_mapping(
+                    child,
+                    document_id=path.stem,
+                    parent_id=page.id or None,
+                    inherited_section_path=[
+                        str(value)
+                        for _, value in sorted(page.section_hierarchy.items())
+                        if str(value).strip()
+                    ],
+                )
                 for child in page.children
                 if isinstance(child, dict)
             ],
+            document_id=path.stem,
+            table_id=(
+                page.id or None
+                if (page.block_type or "").strip().lower() in {"table", "tableofcontents"}
+                else None
+            ),
+            section_path=[
+                str(value)
+                for _, value in sorted(page.section_hierarchy.items())
+                if str(value).strip()
+            ],
+            provenance=page.provenance,
         )
         for page in pages
     ]
 
-    metadata: dict[str, Any] = {"capabilities": marker_capabilities()}
+    metadata: dict[str, Any] = {
+        "capabilities": marker_capabilities(),
+        "tag": next((page.tag for page in pages if page.tag), ""),
+        "parser_profile": next(
+            (page.parser_profile for page in pages if page.parser_profile),
+            "unknown",
+        ),
+        "ocr_used_by_page": {
+            str(page.page_number): bool(page.ocr_used)
+            for page in pages
+        },
+    }
     page_stats: list[dict[str, Any]] = []
     seen_page_ids: set[Any] = set()
     for page in pages:
@@ -1067,6 +1207,25 @@ def parsed_document_from_pages(path: Path, pages: list[PageDocument]) -> ParsedD
         elements=elements,
         metadata=metadata,
     )
+
+
+def parsed_documents_from_pages(pages: list[PageDocument]) -> list[ParsedDocument]:
+    """Agrupa unidades por documento y expone la estructura normalizada completa."""
+    grouped: dict[str, list[PageDocument]] = {}
+    order: list[str] = []
+    for page in pages:
+        key = page.source_path or f"{page.document_id}:{page.source}"
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(page)
+
+    documents: list[ParsedDocument] = []
+    for key in order:
+        document_pages = grouped[key]
+        source_path = Path(document_pages[0].source_path or document_pages[0].source)
+        documents.append(parsed_document_from_pages(source_path, document_pages))
+    return documents
 
 
 def load_marker_document_pages(
@@ -1129,6 +1288,8 @@ def load_docx_pages(docx_path: Path) -> list[PageDocument]:
             page_number=1,
             text=text,
             ocr_used=False,
+            provenance="python-docx",
+            parser_profile="native-docx",
         )
     ]
 
@@ -1148,6 +1309,8 @@ def load_txt_pages(txt_path: Path) -> list[PageDocument]:
             page_number=1,
             text=_normalize_text(text),
             ocr_used=False,
+            provenance="text",
+            parser_profile="native-text",
         )
     ]
 

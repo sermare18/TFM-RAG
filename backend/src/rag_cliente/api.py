@@ -68,12 +68,16 @@ class Citation(BaseModel):
     """Metadatos de trazabilidad devueltos al cliente."""
 
     source_id: str | None = None
+    chunk_id: str | None = None
     document_id: str
+    kind: str | None = None
+    table_id: str | None = None
     source: str
     source_path: str
     source_type: str
     page_start: int
     page_end: int
+    source_pages: list[int] = Field(default_factory=list)
     chunk_index: int
     ocr_used: bool = False
     tag: str | None = None

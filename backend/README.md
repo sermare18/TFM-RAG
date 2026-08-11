@@ -49,12 +49,15 @@ Las opciones principales de almacenamiento y recuperación son:
 LANCEDB_URI=./data/lancedb
 LANCEDB_TABLE=pdf_chunks
 DOCUMENTS_DIR=./data/pdfs
-TOP_K=4
-CHUNK_SIZE=700
-CHUNK_OVERLAP=100
+RETRIEVAL_TOP_K=8
+CHUNK_TARGET_TOKENS=700
+CHUNK_MAX_TOKENS=900
+CHUNK_OVERLAP_TOKENS=100
+TABLE_CHUNK_MAX_TOKENS=1200
 HYBRID_SEARCH_ENABLED=true
-VECTOR_WEIGHT=0.65
-BM25_WEIGHT=0.35
+RRF_K=60
+VECTOR_CANDIDATES=40
+BM25_CANDIDATES=40
 ```
 
 Marker 2 se controla principalmente con `MARKER_ENABLED`, `MARKER_PROFILE`,
@@ -82,6 +85,19 @@ el servicio OpenAI-compatible de Marker mediante el wrapper local presupuestado
 del proyecto. `MARKER_OPENAI_BASE_URL` debe ser loopback, una IP privada o un
 host incluido en `LOCAL_MODEL_HOSTS`; no existe fallback a Gemini ni a APIs
 externas.
+
+El indexador consume la estructura documental de Marker, no su texto aplanado.
+Los bloques ya clasificados por Marker como `Table` o `TableOfContents`
+conservan HTML, filas completas, cabeceras estructurales, identificadores y
+páginas de origen; una fila nunca se parte y una fila excepcionalmente grande se
+marca como `oversize`. Los bloques `Text` nunca se reclasifican como tabla. El
+texto consecutivo de una misma sección puede formar un chunk multipágina, pero
+un cambio de sección impide esa unión.
+
+LanceDB y BM25 usan el esquema de índice v2 y la recuperación híbrida se fusiona
+mediante RRF (`k=60`) antes de seleccionar los resultados finales. Un índice
+anterior se rechaza deliberadamente con una instrucción clara de reindexado;
+ejecuta `rag.bat index` una vez tras actualizar esta versión.
 
 Los procesos `managed` son creados por el supervisor, que conserva sus PIDs,
 espera `/health`, escribe logs en `MODEL_LOGS_DIR` y solo detiene esos procesos.
@@ -193,7 +209,7 @@ curl -X POST http://localhost:8000/index `
 
 curl -X POST http://localhost:8000/ask `
   -H "Content-Type: application/json" `
-  -d '{"question":"Resume el documento","top_k":4}'
+  -d '{"question":"Resume el documento","top_k":8}'
 ```
 
 `POST /files/upload` admite un campo multipart `tag`. `/ask` acepta `tag` o

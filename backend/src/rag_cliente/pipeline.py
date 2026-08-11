@@ -205,6 +205,9 @@ class RagPipeline:
     @staticmethod
     def _match_key(match: dict[str, Any]) -> tuple[Any, ...]:
         """Identificador estable de un chunk para fusionar resultados."""
+        stable_id = match.get("chunk_id") or match.get("id")
+        if stable_id:
+            return (stable_id,)
         return (
             match.get("document_id"),
             match.get("source_path"),
@@ -274,28 +277,40 @@ class RagPipeline:
         """Crea la cita de un chunk recuperado con un ID auditable por el LLM."""
         return {
             "source_id": source_id,
+            "chunk_id": match.get("chunk_id") or match.get("id"),
             "document_id": match["document_id"],
+            "kind": match.get("kind"),
+            "table_id": match.get("table_id"),
             "source": match["source"],
             "source_path": match["source_path"],
             "source_type": match["source_type"],
             "page_start": match["page_start"],
             "page_end": match["page_end"],
+            "source_pages": list(match.get("source_pages") or []),
             "chunk_index": match["chunk_index"],
             "ocr_used": bool(match.get("ocr_used", False)),
             "tag": match.get("tag") or None,
         }
 
     @staticmethod
+    def _page_label(page_start: int, page_end: int) -> str:
+        return f"p.{page_start}" if page_start == page_end else f"pp.{page_start}-{page_end}"
+
+    @staticmethod
     def _source_option_from_match(match: dict[str, Any], source_id: str) -> dict[str, Any]:
         """Prepara un candidato de fuente para la auditoría posterior a la respuesta."""
         return {
             "source_id": source_id,
+            "chunk_id": match.get("chunk_id") or match.get("id"),
             "document_id": match.get("document_id"),
+            "kind": match.get("kind"),
+            "table_id": match.get("table_id"),
             "source": match.get("source"),
             "source_path": match.get("source_path"),
             "source_type": match.get("source_type"),
             "page_start": match.get("page_start"),
             "page_end": match.get("page_end"),
+            "source_pages": list(match.get("source_pages") or []),
             "chunk_index": match.get("chunk_index"),
             "tag": match.get("tag") or None,
             "text": match.get("text", ""),
@@ -342,98 +357,60 @@ class RagPipeline:
         vector_match_groups: list[list[dict[str, Any]]],
         bm25_match_groups: list[list[dict[str, Any]]],
         top_k: int,
-        vector_weight: float,
-        bm25_weight: float,
-        bm25_min_raw_score: float,
+        rrf_k: int = 60,
+        **_legacy_options: Any,
     ) -> list[dict[str, Any]]:
-        """Fusiona resultados vectoriales y BM25 en un ranking híbrido.
-
-        - Vector: LanceDB devuelve `_distance`; se transforma a score con
-          `1 / (1 + distance)`.
-        - BM25: el score de cada grupo se normaliza dividiendo por el máximo
-          score BM25 de ese grupo.
-        - Si un chunk aparece varias veces, se conserva su mejor score por vía.
-        """
+        """Fusiona rankings con RRF sin mezclar escalas vectoriales y BM25."""
         merged: dict[tuple[Any, ...], dict[str, Any]] = {}
 
-        def ensure_item(match: dict[str, Any], rank: int) -> dict[str, Any]:
-            key = cls._match_key(match)
-            item = merged.get(key)
+        def best_ranks(
+            groups: list[list[dict[str, Any]]],
+        ) -> dict[tuple[Any, ...], tuple[int, dict[str, Any]]]:
+            best: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
+            for matches in groups:
+                for rank, match in enumerate(matches, start=1):
+                    key = cls._match_key(match)
+                    current = best.get(key)
+                    if current is None or rank < current[0]:
+                        best[key] = (rank, match)
+            return best
 
-            if item is None:
-                item = dict(match)
-                item["_vector_score"] = 0.0
-                item["_bm25_score"] = 0.0
-                item["_hybrid_rank"] = rank
-                item["_retrieval_sources"] = []
-                merged[key] = item
-            else:
-                item["_hybrid_rank"] = min(
-                    int(item.get("_hybrid_rank", rank)),
-                    rank,
-                )
+        for source, groups in (
+            ("vector", vector_match_groups),
+            ("bm25", bm25_match_groups),
+        ):
+            for key, (rank, match) in best_ranks(groups).items():
+                item = merged.get(key)
+                if item is None:
+                    item = dict(match)
+                    item["_retrieval_sources"] = []
+                    merged[key] = item
+                else:
+                    for field, value in match.items():
+                        item.setdefault(field, value)
 
-            return item
-
-        for matches in vector_match_groups:
-            for rank, match in enumerate(matches):
-                item = ensure_item(match, rank)
-                score = cls._vector_score(match)
-
-                if score > float(item.get("_vector_score", 0.0)):
-                    previous_sources = item.get("_retrieval_sources", [])
-                    item.update(match)
-                    item["_retrieval_sources"] = previous_sources
-                    item["_vector_score"] = score
-
-                if "vector" not in item["_retrieval_sources"]:
-                    item["_retrieval_sources"].append("vector")
-        
-        for matches in bm25_match_groups:
-            raw_scores = [
-                float(match.get("_bm25_score", 0.0))
-                for match in matches
-            ]
-
-            max_score = max(raw_scores, default=0.0)
-
-            # Si incluso el mejor BM25 bruto es muy bajo, ignoramos este grupo.
-            # Esto evita que la normalización convierta resultados malos en 1.0.
-            if max_score < bm25_min_raw_score:
-                continue
-
-            for rank, match in enumerate(matches):
-                raw_score = float(match.get("_bm25_score", 0.0))
-
-                # Filtra candidatos BM25 débiles antes de normalizar
-                if raw_score < bm25_min_raw_score:
-                    continue
-
-                item = ensure_item(match, rank)
-                normalized_score = raw_score / max_score if max_score > 0 else 0.0
-                
-                item["_bm25_score"] = max(
-                    float(item.get("_bm25_score", 0.0)),
-                    normalized_score,
-                )
-                item["_bm25_raw_score"] = max(
-                    float(item.get("_bm25_raw_score", 0.0)),
-                    raw_score,
-                )
-                if "bm25" not in item["_retrieval_sources"]:
-                    item["_retrieval_sources"].append("bm25")
+                item[f"_{source}_rank"] = rank
+                if source == "vector":
+                    item["_vector_score"] = cls._vector_score(match)
+                else:
+                    item["_bm25_raw_score"] = float(match.get("_bm25_score", 0.0))
+                if source not in item["_retrieval_sources"]:
+                    item["_retrieval_sources"].append(source)
 
         for item in merged.values():
-            item["_hybrid_score"] = (
-                vector_weight * float(item.get("_vector_score", 0.0))
-                + bm25_weight * float(item.get("_bm25_score", 0.0))
+            item["_rrf_score"] = sum(
+                1.0 / (rrf_k + int(item[rank_field]))
+                for rank_field in ("_vector_rank", "_bm25_rank")
+                if rank_field in item
             )
 
         ordered_matches = sorted(
             merged.values(),
             key=lambda item: (
-                -float(item.get("_hybrid_score", 0.0)),
-                int(item.get("_hybrid_rank", 0)),
+                -float(item.get("_rrf_score", 0.0)),
+                int(item.get("_vector_rank", 10**9)),
+                int(item.get("_bm25_rank", 10**9)),
+                str(item.get("chunk_id") or item.get("id") or ""),
             ),
         )
 
@@ -447,7 +424,7 @@ class RagPipeline:
         tag: str | None = None,
     ) -> dict[str, Any]:
         """Recupera el contexto RAG y genera metadatos compartidos."""
-        top_k = top_k or self.settings.top_k
+        top_k = top_k or self.settings.effective_retrieval_top_k
         retrieval_query = self.client.rewrite_question_for_retrieval(question, messages=messages)
         retrieval_queries = self._build_retrieval_queries(question, retrieval_query, messages=messages)
 
@@ -479,7 +456,7 @@ class RagPipeline:
                 vector_match_groups = [
                     self.store.search(
                         query_vector,
-                        top_k=top_k,
+                        top_k=self.settings.vector_candidates,
                         tag=normalized_tag or None,
                     )
                     for query_vector in query_vectors
@@ -490,8 +467,6 @@ class RagPipeline:
                 self._release_model_memory()
 
         if self.settings.hybrid_search_enabled:
-            bm25_top_k = top_k * self.settings.bm25_top_k_multiplier
-
             bm25_queries = [
                 query
                 for query in retrieval_queries
@@ -499,7 +474,11 @@ class RagPipeline:
             ]
 
             bm25_match_groups = [
-                self.bm25_store.search(query, top_k=bm25_top_k, tag=normalized_tag or None)
+                self.bm25_store.search(
+                    query,
+                    top_k=self.settings.bm25_candidates,
+                    tag=normalized_tag or None,
+                )
                 for query in bm25_queries
             ]
 
@@ -507,9 +486,7 @@ class RagPipeline:
                 vector_match_groups=vector_match_groups,
                 bm25_match_groups=bm25_match_groups,
                 top_k=top_k,
-                vector_weight=self.settings.vector_weight,
-                bm25_weight=self.settings.bm25_weight,
-                bm25_min_raw_score=self.settings.bm25_min_raw_score,
+                rrf_k=self.settings.rrf_k,
             )
         else:
             matches = self._merge_matches(
@@ -530,11 +507,6 @@ class RagPipeline:
             for index, query in enumerate(bm25_queries, start=1):
                 print(f"  {index}. {query!r}", flush=True)
 
-            print(
-                f"[HYBRID DEBUG] bm25_min_raw_score: {self.settings.bm25_min_raw_score}",
-                flush=True,
-            )
-
         print("[HYBRID DEBUG] selected matches:", flush=True)
         for index, match in enumerate(matches, start=1):
             print(
@@ -547,7 +519,9 @@ class RagPipeline:
                     "_vector_score": match.get("_vector_score"),
                     "_bm25_raw_score": match.get("_bm25_raw_score"),
                     "_bm25_score": match.get("_bm25_score"),
-                    "_hybrid_score": match.get("_hybrid_score"),
+                    "_vector_rank": match.get("_vector_rank"),
+                    "_bm25_rank": match.get("_bm25_rank"),
+                    "_rrf_score": match.get("_rrf_score"),
                     "_retrieval_sources": match.get("_retrieval_sources"),
                 },
                 flush=True,
@@ -564,7 +538,8 @@ class RagPipeline:
             source = match["source"]
             page_start = match["page_start"]
             page_end = match["page_end"]
-            context_blocks.append(f"[{source_id}] {source} p.{page_start}-{page_end}\n{match['text']}")
+            page_label = self._page_label(page_start, page_end)
+            context_blocks.append(f"[{source_id}] {source} {page_label}\n{match['text']}")
             citations.append(self._citation_from_match(match, source_id))
             source_options.append(self._source_option_from_match(match, source_id))
 

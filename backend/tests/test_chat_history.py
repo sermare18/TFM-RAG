@@ -588,7 +588,10 @@ class PipelineChatHistoryTests(unittest.TestCase):
         self.assertEqual(merged[0]["_distance"], 0.4)
 
     def test_ask_and_stream_share_generation_inputs(self) -> None:
-        settings = Settings()
+        settings = Settings(
+            hybrid_search_enabled=False,
+            model_supervision_enabled=False,
+        )
         pipeline = RagPipeline(settings)
 
         history = [
@@ -618,7 +621,7 @@ class PipelineChatHistoryTests(unittest.TestCase):
         ask_result = pipeline.ask("Como me llamo?", top_k=3, messages=history)
         stream_result = pipeline.stream_answer("Como me llamo?", top_k=3, messages=history)
 
-        expected_context = ["[S1] chat.txt p.1-1\nAna dijo que se llama Ana."]
+        expected_context = ["[S1] chat.txt p.1\nAna dijo que se llama Ana."]
 
         pipeline.client.rewrite_question_for_retrieval.assert_any_call(
             "Como me llamo?",
@@ -647,7 +650,10 @@ class PipelineChatHistoryTests(unittest.TestCase):
         self.assertEqual(stream_result["resolve_citations"]("Ana")[0]["document_id"], "doc-1")
 
     def test_prepare_generation_inputs_rewrites_follow_up_for_retrieval(self) -> None:
-        settings = Settings()
+        settings = Settings(
+            hybrid_search_enabled=False,
+            model_supervision_enabled=False,
+        )
         pipeline = RagPipeline(settings)
 
         history = [
@@ -681,7 +687,7 @@ class PipelineChatHistoryTests(unittest.TestCase):
         )
 
     def test_prepare_generation_inputs_passes_tag_to_vector_search(self) -> None:
-        settings = Settings()
+        settings = Settings(model_supervision_enabled=False)
         pipeline = RagPipeline(settings)
 
         pipeline.client = Mock()
@@ -694,10 +700,14 @@ class PipelineChatHistoryTests(unittest.TestCase):
 
         pipeline._prepare_generation_inputs("Resume el contrato", top_k=3, tag="confidencial")
 
-        pipeline.store.search.assert_called_once_with([0.1, 0.2], top_k=3, tag="confidencial")
+        pipeline.store.search.assert_called_once_with(
+            [0.1, 0.2],
+            top_k=40,
+            tag="confidencial",
+        )
         pipeline.bm25_store.search.assert_called_once_with(
             "Resume el contrato",
-            top_k=9,
+            top_k=40,
             tag="confidencial",
         )
 

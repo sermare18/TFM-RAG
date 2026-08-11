@@ -236,7 +236,14 @@ class Settings(BaseSettings):
     # ===================================================================
     # BÚSQUEDA Y RECUPERACIÓN
     # ===================================================================
-    top_k: int = Field(default=2, alias="TOP_K")
+    # TOP_K se conserva como alias histórico. RETRIEVAL_TOP_K, si se define,
+    # prevalece para el número final de resultados fusionados.
+    top_k: int = Field(default=8, alias="TOP_K", ge=1)
+    retrieval_top_k: int | None = Field(
+        default=None,
+        alias="RETRIEVAL_TOP_K",
+        ge=1,
+    )
 
     # ===================================================================
     # BÚSQUEDA HÍBRIDA - VECTORIAL + BM25
@@ -247,12 +254,35 @@ class Settings(BaseSettings):
     bm25_top_k_multiplier: int = Field(default=3, alias="BM25_TOP_K_MULTIPLIER")
     bm25_index_dir: str = Field(default="./data/bm25", alias="BM25_INDEX_DIR")
     bm25_min_raw_score: float = Field(default=0.25, alias="BM25_MIN_RAW_SCORE")
+    rrf_k: int = Field(default=60, alias="RRF_K", ge=1)
+    vector_candidates: int = Field(default=40, alias="VECTOR_CANDIDATES", ge=1)
+    bm25_candidates: int = Field(default=40, alias="BM25_CANDIDATES", ge=1)
 
     # ===================================================================
     # FRAGMENTACIÓN DE DOCUMENTOS
     # ===================================================================
     chunk_size: int = Field(default=700, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP")
+    chunk_target_tokens: int = Field(
+        default=700,
+        alias="CHUNK_TARGET_TOKENS",
+        ge=1,
+    )
+    chunk_max_tokens: int = Field(
+        default=900,
+        alias="CHUNK_MAX_TOKENS",
+        ge=1,
+    )
+    chunk_overlap_tokens: int = Field(
+        default=100,
+        alias="CHUNK_OVERLAP_TOKENS",
+        ge=0,
+    )
+    table_chunk_max_tokens: int = Field(
+        default=1200,
+        alias="TABLE_CHUNK_MAX_TOKENS",
+        ge=1,
+    )
 
     # ===================================================================
     # GENERACIÓN DE RESPUESTAS
@@ -352,6 +382,10 @@ class Settings(BaseSettings):
         if value not in {8192, 16384}:
             raise ValueError("MODEL_CONTEXT_SIZE debe ser 8192 o 16384 en esta fase")
         return value
+
+    @property
+    def effective_retrieval_top_k(self) -> int:
+        return self.retrieval_top_k or self.top_k
 
     @property
     def data_path(self) -> Path:

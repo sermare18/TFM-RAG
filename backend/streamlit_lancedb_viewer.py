@@ -90,10 +90,12 @@ def build_table_rows(rows: list[dict], show_full_text: bool) -> list[dict]:
             {
                 "source": row.get("source"),
                 "source_type": row.get("source_type"),
+                "kind": row.get("kind"),
                 "ocr_used": ocr_label,
                 "tag": row.get("tag"),
                 "page_start": row.get("page_start"),
                 "page_end": row.get("page_end"),
+                "source_pages": row.get("source_pages"),
                 "chunk_index": row.get("chunk_index"),
                 "source_path": row.get("source_path"),
                 "text_preview": row.get("text") if show_full_text else shorten(row.get("text", "")),
@@ -232,6 +234,8 @@ def main() -> None:
         with st.expander(title):
             st.write(f"**source_path:** {row.get('source_path')}")
             st.write(f"**source_type:** {row.get('source_type')}")
+            st.write(f"**kind:** {row.get('kind') or ''}")
+            st.write(f"**source_pages:** {row.get('source_pages') or []}")
             ocr_used = row.get("ocr_used")
             ocr_label = "Sí" if ocr_used is True else "No" if ocr_used is False else "No registrado"
             st.write(f"**ocr_used:** {ocr_label}")

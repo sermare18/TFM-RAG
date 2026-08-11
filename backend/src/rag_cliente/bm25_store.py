@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 from rank_bm25 import BM25Okapi
 
+from rag_cliente.index_schema import INDEX_SCHEMA_VERSION, incompatible_index_message
+
 if TYPE_CHECKING:
     from rag_cliente.indexer import ChunkRecord
 
@@ -44,7 +46,10 @@ class BM25Store:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
 
         rows = [asdict(chunk) for chunk in chunks]
-        payload = {"rows": rows}
+        payload = {
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "rows": rows,
+        }
 
         self.index_path.write_text(
             json.dumps(payload, ensure_ascii=False),
@@ -55,7 +60,13 @@ class BM25Store:
         self._bm25 = self._build_index(rows)
         self._loaded = True
 
-    def search(self, query: str, top_k: int, tag: str | None = None) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        top_k: int,
+        tag: str | None = None,
+        document_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Busca chunks por coincidencia léxica BM25.
 
         Devuelve una lista de diccionarios compatibles con los matches de
@@ -75,6 +86,7 @@ class BM25Store:
 
         scores = self._bm25.get_scores(query_tokens)
         normalized_tag = (tag or "").strip()
+        normalized_document_id = (document_id or "").strip()
 
         ranked_indices = sorted(
             range(len(scores)),
@@ -93,10 +105,15 @@ class BM25Store:
 
             if normalized_tag and str(row.get("tag", "")).strip() != normalized_tag:
                 continue
+            if (
+                normalized_document_id
+                and str(row.get("document_id", "")).strip() != normalized_document_id
+            ):
+                continue
 
             match = dict(row)
             match["_bm25_score"] = score
-            match["_bm25_rank"] = rank
+            match["_bm25_rank"] = rank + 1
 
             matches.append(match)
 
@@ -117,6 +134,9 @@ class BM25Store:
             return
 
         payload = json.loads(self.index_path.read_text(encoding="utf-8"))
+        found_version = payload.get("schema_version")
+        if found_version != INDEX_SCHEMA_VERSION:
+            raise RuntimeError(incompatible_index_message(found_version))
         rows = payload.get("rows", [])
 
         self._rows = [dict(row) for row in rows if isinstance(row, dict)]
