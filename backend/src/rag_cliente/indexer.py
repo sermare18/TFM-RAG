@@ -70,7 +70,6 @@ class MarkdownChunker:
             settings.chunk_overlap_tokens,
             max(0, settings.chunk_max_tokens - 1),
         )
-        self.pages_per_batch = settings.bedrock_pages_per_batch
 
     @staticmethod
     def _chunk_id(
@@ -188,12 +187,7 @@ class MarkdownChunker:
                             source_sha256=document.source_sha256,
                             schema_version=INDEX_SCHEMA_VERSION,
                             tag=document_tag,
-                            metadata={
-                                "batch_index": (
-                                    (page.page_number - 1) // self.pages_per_batch
-                                ),
-                                **document.metadata,
-                            },
+                            metadata={**document.metadata},
                         )
                     )
         return chunks

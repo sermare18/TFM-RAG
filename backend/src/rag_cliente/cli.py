@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from rag_cliente.bedrock_parser import BedrockMarkdownParser
 from rag_cliente.config import get_settings, resolve_local_model_profile
 from rag_cliente.diagnostics import run_doctor
 from rag_cliente.model_manifest import check_models, download_models, plan_models
@@ -25,12 +26,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignore a valid PDF Markdown cache and parse it again with Bedrock.",
     )
 
+    preview_parser = commands.add_parser(
+        "bedrock-preview",
+        help="Extract selected PDF target pages without changing cache or index.",
+    )
+    preview_parser.add_argument("pdf", type=Path)
+    preview_parser.add_argument("pages", type=int, nargs="+")
+
     ask_parser = commands.add_parser("ask", help="Ask against the current index.")
     ask_parser.add_argument("question")
     ask_parser.add_argument("--top-k", type=int, default=None)
     ask_parser.add_argument("--tag", default=None)
     ask_parser.add_argument("--stream", action="store_true")
     ask_parser.add_argument("--show-reasoning", action="store_true")
+    ask_parser.add_argument(
+        "--show-top-k",
+        action="store_true",
+        help="Show the ranked chunks retrieved before source attribution.",
+    )
 
     commands.add_parser("doctor", help="Validate configuration without loading models.")
 
@@ -46,11 +59,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _print_sources(citations: list[dict]) -> None:
     print("\nSources:\n")
+    if not citations:
+        print("[No retrieved source was selected as direct support for the answer.]")
+        return
     for citation in citations:
         print(
             f"- {citation['source']} [{citation['source_type']}] "
-            f"(page {citation['page_start']}, chunk {citation['chunk_index']}, "
+            f"(page {citation['page_start']}, "
+            f"page chunk {citation.get('page_chunk_index', 0)}, "
+            f"chunk {citation['chunk_index']}, "
             f"path: {citation['source_path']})"
+        )
+
+
+def _print_top_k(matches: list[dict]) -> None:
+    print("\nTop-k retrieved:\n")
+    if not matches:
+        print("[No chunks were retrieved.]")
+        return
+    for rank, match in enumerate(matches, start=1):
+        print(
+            f"- #{rank} {match.get('source', 'unknown')} "
+            f"(page {match.get('page_start', '?')}, "
+            f"page chunk {match.get('page_chunk_index', 0)}, "
+            f"chunk {match.get('chunk_index', '?')}, "
+            f"path: {match.get('source_path', 'unknown')})"
         )
 
 
@@ -101,6 +134,19 @@ def main() -> None:
             raise SystemExit(1)
         return
 
+    if args.command == "bedrock-preview":
+        try:
+            pages = BedrockMarkdownParser(settings).preview_pdf_pages(
+                args.pdf,
+                args.pages,
+                progress_callback=print,
+            )
+        except (FileNotFoundError, RuntimeError, TimeoutError, ValueError) as exc:
+            parser.exit(1, f"ERROR: {exc}\n")
+        for page in pages:
+            print(f"\n<!-- PAGE {page.page_number} -->\n{page.markdown}")
+        return
+
     settings.lancedb_path.mkdir(parents=True, exist_ok=True)
     pipeline = RagPipeline(settings)
 
@@ -147,6 +193,8 @@ def main() -> None:
             print(result["reasoning"])
         citations = result["citations"]
     _print_sources(citations)
+    if args.show_top_k:
+        _print_top_k(result.get("matches", []))
 
 
 if __name__ == "__main__":

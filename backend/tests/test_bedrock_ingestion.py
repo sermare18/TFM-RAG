@@ -22,37 +22,72 @@ class FakeBedrockClient:
     def converse(self, **kwargs):
         self.calls.append(kwargs)
         content = kwargs["messages"][0]["content"]
-        markdown_pages = []
+        target_page = None
         for item in content:
             text = item.get("text", "") if isinstance(item, dict) else ""
-            if text.startswith("PAGE ") and " IMAGE" in text:
-                page = int(text.split()[1])
-                markdown_pages.append(
-                    f"# Pagina {page}\n\n| A | B |\n|---|---|\n| {page} | dato |"
-                )
-        pages = {
-            f"slot_{index}": (
-                markdown_pages[index - 1]
-                if index <= len(markdown_pages)
-                else None
-            )
-            for index in range(1, 5)
-        }
+            if text.startswith("TARGET PAGE ") and " IMAGE" in text:
+                target_page = int(text.split()[2])
+        if target_page is None:
+            raise AssertionError("La llamada simulada no identifica la pagina objetivo")
+        markdown = (
+            f"# Pagina {target_page}\n\n"
+            f"| A | B |\n|---|---|\n| {target_page} | dato |"
+        )
         return {
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 100, "outputTokens": 20, "totalTokens": 120},
             "output": {
                 "message": {
-                    "content": [{"text": json.dumps({"pages": pages})}]
+                    "content": [{"text": json.dumps({"markdown": markdown})}]
                 }
             }
         }
 
 
-class FailAfterOneBatchClient(FakeBedrockClient):
+class FailAfterOnePageClient(FakeBedrockClient):
     def converse(self, **kwargs):
         if self.calls:
             self.calls.append(kwargs)
-            raise RuntimeError("synthetic second batch failure")
+            raise RuntimeError("synthetic second page failure")
         return super().converse(**kwargs)
+
+
+class IncompleteThenCompleteClient(FakeBedrockClient):
+    def converse(self, **kwargs):
+        if not self.calls:
+            self.calls.append(kwargs)
+            return {
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 5,
+                    "totalTokens": 105,
+                },
+                "output": {
+                    "message": {
+                        "content": [
+                            {"text": json.dumps({"markdown": "Texto cortado **"})}
+                        ]
+                    }
+                },
+            }
+        return super().converse(**kwargs)
+
+
+class AlwaysIncompleteClient(FakeBedrockClient):
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "stopReason": "max_tokens",
+            "usage": {"inputTokens": 100, "outputTokens": 5, "totalTokens": 105},
+            "output": {
+                "message": {
+                    "content": [
+                        {"text": json.dumps({"markdown": "Texto cortado"})}
+                    ]
+                }
+            },
+        }
 
 
 class DailyQuotaError(RuntimeError):
@@ -104,12 +139,12 @@ class BedrockParserTests(unittest.TestCase):
             aws_region="eu-west-1",
             bedrock_model_id=CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
             bedrock_cache_dir=str(cache),
-            bedrock_pages_per_batch=4,
+            bedrock_context_pages=4,
             bedrock_max_output_tokens=16384,
             model_supervision_enabled=False,
         )
 
-    def test_five_pages_are_sent_as_four_plus_one(self) -> None:
+    def test_each_target_page_gets_one_call_with_a_four_page_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "document.pdf"
@@ -124,12 +159,12 @@ class BedrockParserTests(unittest.TestCase):
             document = parser.parse_pdf(source)
 
             self.assertEqual([page.page_number for page in document.pages], [1, 2, 3, 4, 5])
-            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(len(client.calls), 5)
             image_counts = [
                 sum("image" in block for block in call["messages"][0]["content"])
                 for call in client.calls
             ]
-            self.assertEqual(image_counts, [4, 1])
+            self.assertEqual(image_counts, [4, 4, 4, 4, 4])
             self.assertEqual(
                 client.calls[0]["modelId"],
                 CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
@@ -142,41 +177,153 @@ class BedrockParserTests(unittest.TestCase):
                 client.calls[0]["outputConfig"]["textFormat"]["structure"]
                 ["jsonSchema"]["schema"]
             )
-            self.assertEqual(output_schema["required"], ["pages"])
+            self.assertEqual(output_schema["required"], ["markdown"])
             self.assertFalse(output_schema["additionalProperties"])
-            page_schema = output_schema["properties"]["pages"]
             self.assertEqual(
-                page_schema["required"],
-                ["slot_1", "slot_2", "slot_3", "slot_4"],
-            )
-            self.assertFalse(page_schema["additionalProperties"])
-            self.assertEqual(
-                page_schema["properties"]["slot_1"],
+                output_schema["properties"]["markdown"],
                 {"type": "string"},
             )
-            self.assertEqual(
-                page_schema["properties"]["slot_4"],
-                {"type": "string"},
+            self.assertIn("TARGET PAGE image is the primary", BEDROCK_SYSTEM_PROMPT)
+
+            target_labels = []
+            for call in client.calls:
+                labels = [
+                    block.get("text", "")
+                    for block in call["messages"][0]["content"]
+                    if block.get("text", "").startswith("TARGET PAGE ")
+                ]
+                self.assertEqual(len(labels), 1)
+                target_labels.append(int(labels[0].split()[2]))
+                references = [
+                    block.get("text", "")
+                    for block in call["messages"][0]["content"]
+                    if "<target_reference_text" in block.get("text", "")
+                ]
+                self.assertEqual(len(references), 1)
+                self.assertIn(f'page="{target_labels[-1]}"', references[0])
+            self.assertEqual(target_labels, [1, 2, 3, 4, 5])
+
+    def test_sliding_window_crosses_old_batch_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "document.pdf"
+            source.write_bytes(b"synthetic-pdf")
+            client = FakeBedrockClient()
+            parser = BedrockMarkdownParser(self.make_settings(root / "cache"), client)
+            parser._render_pdf = lambda _source: [
+                (page, f"png-{page}".encode(), f"reference {page}")
+                for page in range(1, 7)
+            ]
+
+            parser.parse_pdf(source)
+
+            fourth_call_text = "\n".join(
+                block.get("text", "")
+                for block in client.calls[3]["messages"][0]["content"]
             )
-            final_output_schema = json.loads(
-                client.calls[1]["outputConfig"]["textFormat"]["structure"]
-                ["jsonSchema"]["schema"]
+            self.assertIn("CONTEXT ONLY PAGE 2 IMAGE", fourth_call_text)
+            self.assertIn("CONTEXT ONLY PAGE 3 IMAGE", fourth_call_text)
+            self.assertIn("TARGET PAGE 4 IMAGE", fourth_call_text)
+            self.assertIn("CONTEXT ONLY PAGE 5 IMAGE", fourth_call_text)
+            self.assertNotIn('target_reference_text page="3"', fourth_call_text)
+            self.assertIn('target_reference_text page="4"', fourth_call_text)
+
+    def test_preview_calls_only_selected_target_and_does_not_write_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "document.pdf"
+            source.write_bytes(b"synthetic-pdf")
+            client = FakeBedrockClient()
+            parser = BedrockMarkdownParser(self.make_settings(root / "cache"), client)
+            parser._render_pdf = lambda _source: [
+                (page, f"png-{page}".encode(), f"reference {page}")
+                for page in range(1, 7)
+            ]
+
+            pages = parser.preview_pdf_pages(source, [4])
+
+            self.assertEqual([page.page_number for page in pages], [4])
+            self.assertEqual(len(client.calls), 1)
+            call_text = "\n".join(
+                block.get("text", "")
+                for block in client.calls[0]["messages"][0]["content"]
             )
-            final_page_schema = final_output_schema["properties"]["pages"]
-            self.assertEqual(
-                final_page_schema["properties"]["slot_1"],
-                {"type": "string"},
+            self.assertIn("TARGET PAGE 4 IMAGE", call_text)
+            self.assertIn("CONTEXT ONLY PAGE 2 IMAGE", call_text)
+            self.assertIn("CONTEXT ONLY PAGE 3 IMAGE", call_text)
+            self.assertIn("CONTEXT ONLY PAGE 5 IMAGE", call_text)
+            markdown_path, manifest_path = parser._cache_paths(source)
+            self.assertFalse(markdown_path.exists())
+            self.assertFalse(manifest_path.exists())
+
+    def test_incomplete_markdown_is_retried_once_then_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "document.pdf"
+            source.write_bytes(b"synthetic-pdf")
+            client = IncompleteThenCompleteClient()
+            parser = BedrockMarkdownParser(self.make_settings(root / "cache"), client)
+            parser._render_pdf = lambda _source: [(1, b"png", "referencia corta")]
+
+            document = parser.parse_pdf(source)
+
+            self.assertEqual(len(client.calls), 2)
+            self.assertIn("# Pagina 1", document.pages[0].markdown)
+
+    def test_retry_uses_only_the_target_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = IncompleteThenCompleteClient()
+            parser = BedrockMarkdownParser(self.make_settings(root / "cache"), client)
+            window = [
+                (page, f"png-{page}".encode(), f"referencia {page}")
+                for page in range(1, 5)
+            ]
+
+            page = parser._invoke_target(window, 3)
+
+            self.assertEqual(page.page_number, 3)
+            image_counts = [
+                sum("image" in block for block in call["messages"][0]["content"])
+                for call in client.calls
+            ]
+            self.assertEqual(image_counts, [4, 1])
+            retry_text = "\n".join(
+                block.get("text", "")
+                for block in client.calls[1]["messages"][0]["content"]
             )
-            self.assertEqual(
-                final_page_schema["properties"]["slot_2"],
-                {"type": "null"},
-            )
-            request_text = client.calls[1]["messages"][0]["content"][0]["text"]
-            self.assertIn('"slot_1":5', request_text)
-            self.assertIn('"slot_2":null', request_text)
-            self.assertIn("primary and authoritative", BEDROCK_SYSTEM_PROMPT)
-            first_content = client.calls[0]["messages"][0]["content"]
-            self.assertTrue(any("<reference_text" in block.get("text", "") for block in first_content))
+            self.assertNotIn("CONTEXT ONLY", retry_text)
+            self.assertIn("TARGET PAGE 3 IMAGE", retry_text)
+
+    def test_two_incomplete_responses_skip_page_and_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "document.pdf"
+            source.write_bytes(b"synthetic-pdf")
+            client = AlwaysIncompleteClient()
+            parser = BedrockMarkdownParser(self.make_settings(root / "cache"), client)
+            parser._render_pdf = lambda _source: [(1, b"png", "referencia corta")]
+
+            document = parser.parse_pdf(source)
+
+            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(len(document.pages), 1)
+            self.assertEqual(document.pages[0].markdown, "")
+            self.assertIn(1, document.metadata["failed_pages"])
+            markdown_path, manifest_path = parser._cache_paths(source)
+            self.assertTrue(markdown_path.exists())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(manifest["complete"])
+            self.assertIn("1", manifest["failed_pages"])
+
+    def test_low_reference_coverage_is_rejected(self) -> None:
+        reference = " ".join(f"palabra{index}" for index in range(60))
+        markdown = " ".join(f"palabra{index}" for index in range(10))
+
+        issue = BedrockMarkdownParser._reference_coverage_issue(markdown, reference)
+
+        self.assertIsNotNone(issue)
+        self.assertIn("cobertura", issue or "")
 
     def test_valid_cache_is_reused_while_bedrock_is_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -196,7 +343,7 @@ class BedrockParserTests(unittest.TestCase):
             self.assertTrue(cached.metadata["cache_hit"])
             self.assertEqual(second_client.calls, [])
 
-    def test_partial_cache_resumes_after_last_completed_batch(self) -> None:
+    def test_partial_cache_resumes_after_last_completed_page(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "document.pdf"
@@ -207,15 +354,15 @@ class BedrockParserTests(unittest.TestCase):
                 for page in range(1, 6)
             ]
 
-            failing = BedrockMarkdownParser(settings, FailAfterOneBatchClient())
+            failing = BedrockMarkdownParser(settings, FailAfterOnePageClient())
             failing._render_pdf = lambda _source: rendered
-            with self.assertRaisesRegex(RuntimeError, "second batch failure"):
+            with self.assertRaisesRegex(RuntimeError, "second page failure"):
                 failing.parse_pdf(source)
 
             _markdown_path, manifest_path = failing._cache_paths(source)
             partial = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(partial["complete"])
-            self.assertEqual(partial["page_numbers"], [1, 2, 3, 4])
+            self.assertEqual(partial["page_numbers"], [1])
 
             resumed_client = FakeBedrockClient()
             resumed = BedrockMarkdownParser(settings, resumed_client)
@@ -223,13 +370,13 @@ class BedrockParserTests(unittest.TestCase):
             document = resumed.parse_pdf(source)
 
             self.assertEqual([page.page_number for page in document.pages], [1, 2, 3, 4, 5])
-            self.assertEqual(len(resumed_client.calls), 1)
+            self.assertEqual(len(resumed_client.calls), 4)
             sent_text = "\n".join(
                 block.get("text", "")
                 for block in resumed_client.calls[0]["messages"][0]["content"]
             )
-            self.assertIn("PAGE 5 IMAGE", sent_text)
-            self.assertNotIn("PAGE 4 IMAGE", sent_text)
+            self.assertIn("TARGET PAGE 2 IMAGE", sent_text)
+            self.assertIn("CONTEXT ONLY PAGE 1 IMAGE", sent_text)
             complete = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertTrue(complete["complete"])
 

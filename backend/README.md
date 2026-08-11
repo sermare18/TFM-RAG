@@ -7,13 +7,15 @@ y generación de respuestas mediante `llama.cpp`.
 ## Arquitectura
 
 1. PyMuPDF renderiza cada página del PDF y obtiene texto digital auxiliar.
-2. Bedrock recibe cuatro páginas consecutivas por llamada. Las imágenes son la
-   fuente autoritativa; el texto extraído se etiqueta como referencia no fiable.
-3. Bedrock fuerza la respuesta mediante un esquema de salida estructurada. El
-   JSON validado contiene Markdown separado por página.
+2. Cada llamada a Bedrock extrae una sola página objetivo, pero muestra al VLM
+   una ventana deslizante de hasta cuatro páginas para conservar el contexto de
+   tablas y estructuras multipágina. Solo la imagen objetivo es transcribible.
+3. Bedrock fuerza la respuesta mediante un esquema de salida estructurada con
+   un único campo `markdown`. El programa asigna ese resultado a la página
+   objetivo; el modelo no elige ni devuelve el número de página.
 4. El Markdown y un manifiesto con hash, modelo y prompt quedan en
-   `data/markdown`. Cada lote completado se guarda inmediatamente, por lo que
-   una cuota o corte posterior no obliga a pagar otra vez por esas páginas.
+   `data/markdown`. Cada página completada se guarda inmediatamente, por lo que
+   una cuota o corte posterior no obliga a pagar otra vez por ella.
 5. El chunking nunca cruza una página. Una página grande puede producir varios
    chunks con el mismo número de página.
 6. LanceDB guarda los vectores y BM25 el índice léxico. La recuperación admite
@@ -23,12 +25,34 @@ y generación de respuestas mediante `llama.cpp`.
 Los `.md` entran directamente. Si contienen separadores `<!-- PAGE N -->`, se
 conserva la paginación; sin separadores se consideran una sola página.
 
-### Relación entre páginas, lotes y chunks
+### Relación entre páginas, contexto y chunks
 
-Los lotes de cuatro páginas solo sirven para dar contexto visual a Bedrock
-durante la conversión y no se almacenan como una unidad. El indexador mantiene
-siempre la frontera de página: cada chunk pertenece a una única página y nunca
-mezcla contenido de páginas distintas.
+La ventana de cuatro páginas solo da contexto visual a Bedrock y no se almacena
+como una unidad. En cada llamada una página está marcada como objetivo y las
+demás como contexto no transcribible. El texto digital auxiliar se envía solo
+para la página objetivo. El indexador mantiene siempre la frontera de página:
+cada chunk pertenece a una única página y nunca mezcla contenido de páginas
+distintas.
+
+Siempre que los límites del documento lo permiten, la ventana coloca la página
+objetivo en tercera posición: dos páginas anteriores, la objetivo y una posterior.
+Esto prioriza los encabezados y el inicio de las tablas que continúan desde
+páginas anteriores.
+
+Este contrato evita el desplazamiento entre `slots` observado cuando una sola
+respuesta contenía cuatro páginas. Las páginas vecinas pueden ayudar a recuperar
+los encabezados o la estructura de una tabla continuada, pero el prompt prohíbe
+copiar sus filas o su texto al resultado objetivo.
+
+Antes de guardar una página, el parser exige que Bedrock termine con
+`stopReason=end_turn`, rechaza Markdown con estructuras abiertas y, cuando el
+PDF contiene texto digital suficiente, comprueba que no falte una parte grande
+respecto al texto auxiliar. Una salida incompleta se repite una sola vez; si el
+segundo intento también falla, la página queda registrada como fallida y vacía,
+no genera chunks y la extracción continúa con las siguientes. El segundo intento
+recibe solo la imagen objetivo y su texto auxiliar para evitar que las páginas
+vecinas vuelvan a distraer al modelo. Los errores de cuota, autenticación o
+servicio sí detienen el proceso, ya que afectarían también al resto de páginas.
 
 Una página corta genera normalmente un chunk. Una página larga puede generar
 varios, con los valores predeterminados de 700 tokens objetivo, 900 tokens
@@ -54,10 +78,10 @@ BEDROCK_ENABLED=true
 AWS_PROFILE=rag-bedrock
 AWS_REGION=eu-west-1
 BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6
-BEDROCK_PAGES_PER_BATCH=4
+BEDROCK_CONTEXT_PAGES=4
 BEDROCK_MAX_OUTPUT_TOKENS=16384
 BEDROCK_MAX_PAGES_PER_DOCUMENT=200
-BEDROCK_MAX_BATCHES_PER_DOCUMENT=50
+BEDROCK_MAX_CALLS_PER_DOCUMENT=200
 ```
 
 Mientras esté desactivado, los PDF solo se indexan si ya existe una caché
@@ -70,10 +94,11 @@ aprovecha la cuota global concedida a la cuenta. AWS puede enrutar el contenido
 a cualquier región comercial; si se necesita residencia europea debe usarse el
 perfil `eu.anthropic.claude-sonnet-4-6` y disponer de su cuota correspondiente.
 
-Si se alcanza la cuota de tokens por minuto, la siguiente ejecución reanuda el
-primer lote pendiente. Cada lote correcto ya queda persistido en la caché. Los
-modelos Anthropic requieren además enviar una vez el formulario de caso de uso
-desde la consola de Bedrock.
+Si se alcanza la cuota de tokens por minuto, la siguiente ejecución reanuda la
+primera página pendiente. Cada página correcta ya queda persistida en la caché.
+El coste pasa a ser una llamada por página, aunque cada llamada lleve hasta
+cuatro imágenes para aportar contexto. Los modelos Anthropic requieren además
+enviar una vez el formulario de caso de uso desde la consola de Bedrock.
 
 ## Preparación
 
@@ -108,11 +133,18 @@ usar `--refresh-bedrock` ni volver a pagar la conversión de los PDF.
 # Indexa PDF y Markdown; reutiliza la caché Bedrock válida
 .\rag.bat index data\pdfs
 
-# Fuerza una nueva conversión de los PDF
+# Fuerza una nueva conversión de los PDF aunque exista una caché válida.
 .\rag.bat index data\pdfs --refresh-bedrock
+
+# Prueba solo la página 31 con contexto vecino; consume una llamada y no cambia
+# ni la caché ni el índice.
+.\rag.bat bedrock-preview data\pdfs\guias\guia.pdf 31
 
 # Consulta
 .\rag.bat ask "¿Qué indica el documento?" --top-k 5
+
+# Muestra también la página y el chunk de cada resultado recuperado
+.\rag.bat ask "¿Qué indica el documento?" --stream --show-top-k
 
 # API y visor
 .\rag.bat api
@@ -126,12 +158,18 @@ Para la primera prueba conviene usar una carpeta que contenga un solo PDF:
 .\rag.bat index data\prueba-bedrock --tag prueba
 ```
 
+El cambio desde el antiguo contrato por lotes/`slots` invalida automáticamente
+su caché mediante `BEDROCK_PROMPT_VERSION`; no hace falta añadir
+`--refresh-bedrock` para esa primera migración.
+
 `doctor` no llama a AWS ni consume tokens. El segundo comando sí realiza las
 llamadas necesarias y guarda el Markdown por página en `data/markdown`.
 
 Cambiar `RETRIEVAL_MODE=vector|bm25|hybrid` y `RETRIEVAL_TOP_K` permite comparar
 configuraciones sobre el mismo índice. El resultado recuperado se colapsa por
 página, lo que deja preparado el cálculo posterior de precisión y recall.
+`--show-top-k` muestra esos resultados antes de que el auditor de citas descarte
+los que no soportan directamente la respuesta final.
 
 ## Verificación
 

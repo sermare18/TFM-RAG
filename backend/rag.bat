@@ -24,6 +24,7 @@ if /I "%COMMAND%"=="test" goto :test
 if /I "%COMMAND%"=="gpu" goto :gpu
 if /I "%COMMAND%"=="doctor" goto :doctor
 if /I "%COMMAND%"=="models" goto :models
+if /I "%COMMAND%"=="bedrock-preview" goto :bedrock_preview
 goto :help
 
 :api
@@ -75,6 +76,14 @@ if "%~2"=="" (
 conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli models %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %ERRORLEVEL%
 
+:bedrock_preview
+if "%~2"=="" (
+    echo Uso: rag.bat bedrock-preview ^<pdf^> ^<pagina^> [pagina...]
+    exit /b 1
+)
+conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli bedrock-preview %FORWARD_ARGS%
+exit /b %ERRORLEVEL%
+
 :help
 echo Uso: rag.bat ^<comando^> [argumento]
 echo.
@@ -89,4 +98,5 @@ echo   models plan cpu    Muestra el plan local de modelos CPU sin descargar
 echo   models plan gpu    Muestra el plan local de modelos GPU sin descargar
 echo   models download cpu/gpu  Descarga solo al solicitarlo explicitamente
 echo   models check       Valida los GGUF locales sin cargar modelos
+echo   bedrock-preview    Extrae paginas concretas sin cambiar cache ni indice
 exit /b 0

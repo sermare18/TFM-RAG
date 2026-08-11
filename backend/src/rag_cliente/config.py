@@ -123,9 +123,9 @@ class Settings(BaseSettings):
         default=CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
         alias="BEDROCK_MODEL_ID",
     )
-    bedrock_pages_per_batch: int = Field(
+    bedrock_context_pages: int = Field(
         default=4,
-        alias="BEDROCK_PAGES_PER_BATCH",
+        alias="BEDROCK_CONTEXT_PAGES",
     )
     bedrock_render_dpi: int = Field(
         default=144,
@@ -144,9 +144,9 @@ class Settings(BaseSettings):
         alias="BEDROCK_MAX_PAGES_PER_DOCUMENT",
         ge=1,
     )
-    bedrock_max_batches_per_document: int = Field(
-        default=50,
-        alias="BEDROCK_MAX_BATCHES_PER_DOCUMENT",
+    bedrock_max_calls_per_document: int = Field(
+        default=200,
+        alias="BEDROCK_MAX_CALLS_PER_DOCUMENT",
         ge=1,
     )
     bedrock_request_timeout: float = Field(
@@ -166,7 +166,7 @@ class Settings(BaseSettings):
         ge=0,
     )
     bedrock_prompt_version: str = Field(
-        default="claude-sonnet-4-6-page-markdown-v1",
+        default="claude-sonnet-4-6-target-third-validated-v4",
         alias="BEDROCK_PROMPT_VERSION",
     )
     bedrock_cache_dir: str = Field(
@@ -229,11 +229,11 @@ class Settings(BaseSettings):
             raise ValueError("MODEL_CONTEXT_SIZE debe ser 8192 o 16384")
         return value
 
-    @field_validator("bedrock_pages_per_batch")
+    @field_validator("bedrock_context_pages")
     @classmethod
-    def validate_bedrock_batch_size(cls, value: int) -> int:
+    def validate_bedrock_context_size(cls, value: int) -> int:
         if value != 4:
-            raise ValueError("BEDROCK_PAGES_PER_BATCH debe ser exactamente 4")
+            raise ValueError("BEDROCK_CONTEXT_PAGES debe ser exactamente 4")
         return value
 
     @property

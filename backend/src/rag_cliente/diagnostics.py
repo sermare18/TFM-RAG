@@ -95,9 +95,9 @@ def run_doctor(settings: Settings) -> dict:
             "detail": settings.bedrock_model_id or "[sin configurar]",
         },
         {
-            "name": "bedrock_pages_per_batch",
-            "ok": settings.bedrock_pages_per_batch == 4,
-            "detail": str(settings.bedrock_pages_per_batch),
+            "name": "bedrock_context_pages",
+            "ok": settings.bedrock_context_pages == 4,
+            "detail": str(settings.bedrock_context_pages),
         },
     ]
     return {
@@ -114,7 +114,7 @@ def run_doctor(settings: Settings) -> dict:
             "configured": bedrock_configured,
             "boto3_installed": boto3_installed,
             "global_claude_profile": global_claude_profile,
-            "pages_per_batch": settings.bedrock_pages_per_batch,
+            "context_pages": settings.bedrock_context_pages,
             "cache_dir": str(settings.bedrock_cache_path),
             "network_checked": False,
         },
