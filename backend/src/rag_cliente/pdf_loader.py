@@ -9,16 +9,17 @@ Formatos soportados:
 - Si desactivo Marker, conservo fallbacks nativos para PDF digital, DOCX y TXT.
 
 Decisión principal:
-Uso Marker 2 en modo adaptativo para conservar texto digital fiable y activar
-OCR/VLM solo en páginas, bloques o tablas que lo necesiten. Pido Markdown
-paginado porque conserva estructura útil para RAG y mantiene las citas.
+Uso exclusivamente el converter y los builders oficiales de Marker 2. La
+salida primaria es JSON estructurado; el renderer Markdown anterior queda
+disponible solo mediante un flag temporal de compatibilidad.
 """
 from __future__ import annotations
 
+import html as html_lib
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable
@@ -26,7 +27,7 @@ from typing import Any, Callable
 import fitz
 from docx import Document
 
-from rag_cliente.config import Settings
+from rag_cliente.config import ResolvedMarkerProfile, Settings, resolve_marker_profile
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 MARKER_DOCUMENT_SUFFIXES = {
@@ -58,6 +59,9 @@ class PageDocument:
         text: Contenido textual normalizado.
         ocr_used: Indica si el texto de esta página/unidad procede de OCR.
         tag: Etiqueta derivada de la primera carpeta relativa bajo el directorio indexado.
+        block_type/id/html/page/polygon/children/section_hierarchy: Estructura
+            oficial conservada desde la salida JSON de Marker.
+        extraction_metadata: Metadatos de extracción del documento y la página.
     """
 
     document_id: str
@@ -68,6 +72,14 @@ class PageDocument:
     text: str
     ocr_used: bool = False
     tag: str = ""
+    block_type: str = ""
+    id: str = ""
+    html: str = ""
+    page: int | None = None
+    polygon: list[list[float]] = field(default_factory=list)
+    children: list[dict[str, Any]] = field(default_factory=list)
+    section_hierarchy: dict[str, Any] = field(default_factory=dict)
+    extraction_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _emit(progress_callback: ProgressCallback | None, message: str) -> None:
@@ -198,6 +210,46 @@ class MarkerMarkdownRendererWithOcrMetadata:
         return rendered
 
 
+class MarkerJSONRendererWithOcrMetadata:
+    """Delega la estructura al renderer JSON público y añade metadatos OCR."""
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        from marker.renderers.json import JSONRenderer
+
+        self._renderer = JSONRenderer(config=config)
+
+    def __call__(self, document: Any) -> Any:
+        rendered = self._renderer(document)
+        metadata = dict(getattr(rendered, "metadata", {}) or {})
+        page_stats_by_id: dict[int, dict[str, Any]] = {}
+
+        for page_stat in metadata.get("page_stats", []) or []:
+            if not isinstance(page_stat, dict):
+                continue
+            try:
+                page_stats_by_id[int(page_stat.get("page_id"))] = dict(page_stat)
+            except (TypeError, ValueError):
+                continue
+
+        enriched_page_stats: list[dict[str, Any]] = []
+        for page in getattr(document, "pages", []) or []:
+            try:
+                page_id = int(getattr(page, "page_id", None))
+            except (TypeError, ValueError):
+                continue
+            page_stat = page_stats_by_id.get(page_id, {"page_id": page_id})
+            page_stat.update(_collect_marker_page_extraction_details(page, document))
+            enriched_page_stats.append(page_stat)
+
+        if enriched_page_stats:
+            metadata["page_stats"] = enriched_page_stats
+
+        if hasattr(rendered, "model_copy"):
+            return rendered.model_copy(update={"metadata": metadata})
+        rendered.metadata = metadata
+        return rendered
+
+
 def _load_native_pdf_pages(pdf_path: Path) -> list[PageDocument]:
     """Fallback rápido para PDFs digitales cuando Marker está deshabilitado."""
     pages: list[PageDocument] = []
@@ -220,32 +272,24 @@ def _load_native_pdf_pages(pdf_path: Path) -> list[PageDocument]:
     return pages
 
 
-def _build_marker_config(settings: Settings) -> dict[str, Any]:
-    """Construyo la configuración adaptativa de Marker 2.
-
-    Uso `balanced` por defecto en CUDA para que Marker decida automáticamente
-    entre pdftext, OCR completo y fallback visual de tablas. Mantengo
-    `force_ocr` como override manual, pero no lo necesito en el flujo normal.
-    """
-    ocr_mode = settings.marker_ocr_mode
+def _build_marker_config(
+    settings: Settings,
+    profile: ResolvedMarkerProfile | None = None,
+) -> dict[str, Any]:
+    """Construye configuración exacta para uno de los perfiles soportados."""
+    resolved_profile = profile or resolve_marker_profile(settings)
     config: dict[str, Any] = {
-        "output_format": "markdown",
-        "paginate_output": True,
+        "output_format": "markdown" if settings.marker_markdown_compatibility else "json",
+        "paginate_output": settings.marker_markdown_compatibility,
         "disable_image_extraction": settings.marker_disable_image_extraction,
-        "mode": settings.marker_mode,
-        "disable_ocr": ocr_mode == "disabled",
+        "mode": resolved_profile.mode,
+        "disable_ocr": resolved_profile.disable_ocr,
+        "use_llm": resolved_profile.use_llm,
         "min_recon_score": settings.marker_table_min_recon_score,
-        "force_ocr_complex_layout": settings.marker_full_page_ocr_complex_layout,
     }
-
-    if ocr_mode == "force":
-        config["force_ocr"] = True
 
     if settings.marker_strip_existing_ocr:
         config["strip_existing_ocr"] = True
-
-    if settings.marker_use_llm:
-        config["use_llm"] = True
 
     if settings.marker_page_range.strip():
         config["page_range"] = settings.marker_page_range.strip()
@@ -324,21 +368,27 @@ def create_marker_converter(settings: Settings) -> Any:
     Raises:
         RuntimeError: Si `marker-pdf` no está instalado o no puede inicializarse.
     """
-    _require_marker_2()
-    marker_device = settings.marker_torch_device.strip().lower()
-    if marker_device:
-        # Fijo TORCH_DEVICE antes de importar Marker para que yo no inicialice
-        # accidentalmente los modelos grandes en CPU.
-        os.environ["TORCH_DEVICE"] = marker_device
+    profile = resolve_marker_profile(settings)
 
-    inference_backend = settings.marker_inference_backend.strip().lower()
-    if inference_backend != "auto":
-        # Propago el backend antes de importar Surya para que yo controle si el
-        # servidor visual se ejecuta con vLLM/Docker o con llama.cpp local.
-        os.environ["SURYA_INFERENCE_BACKEND"] = inference_backend
+    if profile.use_llm:
+        # La conexión VLM local se incorpora en la fase siguiente. Fallo antes
+        # de comprobar Marker o crear modelos para que ConfigParser no pueda
+        # seleccionar por defecto el servicio Gemini.
+        raise RuntimeError(
+            f"El perfil {profile.name} requiere un endpoint VLM local válido; "
+            "su conexión se implementará en una fase posterior. No se usará Gemini."
+        )
+
+    _require_marker_2()
+    os.environ["TORCH_DEVICE"] = profile.torch_device
+
+    if profile.inference_backend is None:
+        os.environ.pop("SURYA_INFERENCE_BACKEND", None)
+    else:
+        os.environ["SURYA_INFERENCE_BACKEND"] = profile.inference_backend
 
     llama_cpp_binary = settings.marker_llama_cpp_binary.strip()
-    if llama_cpp_binary:
+    if profile.inference_backend == "llamacpp":
         resolved_binary = Path(llama_cpp_binary).expanduser().resolve()
         if not resolved_binary.is_file():
             raise RuntimeError(
@@ -346,7 +396,7 @@ def create_marker_converter(settings: Settings) -> Any:
             )
         os.environ["LLAMA_CPP_BINARY"] = str(resolved_binary)
 
-    if marker_device == "cuda":
+    if profile.torch_device == "cuda":
         try:
             import torch
         except ImportError as exc:
@@ -356,21 +406,14 @@ def create_marker_converter(settings: Settings) -> Any:
 
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "MARKER_TORCH_DEVICE=cuda, pero PyTorch no detecta la GPU. "
-                "Ejecuta setup.ps1 y comprueba el resultado con 'rag.bat gpu'."
+                "El perfil gpu-quality requiere CUDA, pero PyTorch no detecta una GPU NVIDIA. "
+                "Ejecuta setup.ps1 -Device cuda y comprueba el resultado con 'rag.bat gpu'."
             )
 
     try:
-        from marker.builders.document import DocumentBuilder
-        from marker.builders.layout import LayoutBuilder
-        from marker.builders.line import LineBuilder
-        from marker.builders.ocr import OcrBuilder
-        from marker.builders.structure import StructureBuilder
         from marker.config.parser import ConfigParser
         from marker.converters.pdf import PdfConverter
         from marker.models import create_model_dict
-        from marker.providers.registry import provider_from_filepath
-        from marker.schema import BlockTypes
     except ImportError as exc:
         raise RuntimeError(
             "Marker 2 no está instalado con todos los proveedores. "
@@ -381,73 +424,38 @@ def create_marker_converter(settings: Settings) -> Any:
     _install_surya_windows_cleanup_workaround()
 
     try:
-        class LayoutAwareLineBuilder(LineBuilder):
-            """Promuevo a OCR completo las páginas que yo detecto como complejas."""
-
-            force_ocr_complex_layout: bool = True
-            complex_layout_types = (
-                BlockTypes.Table,
-                BlockTypes.Form,
-                BlockTypes.ComplexRegion,
-            )
-
-            def get_all_lines(self, document: Any, provider: Any) -> dict[int, list[Any]]:
-                page_lines = super().get_all_lines(document, provider)
-                if self.disable_ocr or not self.force_ocr_complex_layout:
-                    return page_lines
-
-                for page in document.pages:
-                    # Decido después del layout y antes del OCR: si veo una
-                    # estructura compleja, descarto solo las líneas digitales de
-                    # esa página para que Surya la reconstruya con contexto global.
-                    blocks = page.structure_blocks(document)
-                    if any(block.block_type in self.complex_layout_types for block in blocks):
-                        page.text_extraction_method = "surya"
-                        page_lines[page.page_id] = []
-                return page_lines
-
-        class AdaptivePdfConverter(PdfConverter):
-            """Uso mi selector de OCR por layout sin alterar los procesadores de Marker."""
-
-            def build_document(self, filepath: str) -> Any:
-                provider_cls = provider_from_filepath(filepath)
-                layout_builder = self.resolve_dependencies(LayoutBuilder)
-                line_builder = self.resolve_dependencies(LayoutAwareLineBuilder)
-                ocr_builder = self.resolve_dependencies(OcrBuilder)
-                provider = provider_cls(filepath, self.config)
-                document = DocumentBuilder(self.config)(
-                    provider,
-                    layout_builder,
-                    line_builder,
-                    ocr_builder,
-                )
-                structure_builder = self.resolve_dependencies(StructureBuilder)
-                structure_builder(document)
-                for processor in self.processor_list:
-                    processor(document)
-                return document
-
-        config_parser = ConfigParser(_build_marker_config(settings))
-        return AdaptivePdfConverter(
+        config_parser = ConfigParser(_build_marker_config(settings, profile))
+        renderer = (
+            "rag_cliente.pdf_loader.MarkerMarkdownRendererWithOcrMetadata"
+            if settings.marker_markdown_compatibility
+            else "rag_cliente.pdf_loader.MarkerJSONRendererWithOcrMetadata"
+        )
+        return PdfConverter(
             config=config_parser.generate_config_dict(),
             artifact_dict=create_model_dict(
-                inference_backend=None if inference_backend == "auto" else inference_backend
+                inference_backend=profile.inference_backend
             ),
             processor_list=config_parser.get_processors(),
-            renderer="rag_cliente.pdf_loader.MarkerMarkdownRendererWithOcrMetadata",
-            llm_service=config_parser.get_llm_service(),
+            renderer=renderer,
+            llm_service=None,
         )
     except Exception as exc:
         raise RuntimeError(f"No se pudo inicializar Marker: {exc}") from exc
 
 
-def _render_with_marker(path: Path, marker_converter: Any) -> tuple[str, dict[str, Any]]:
-    """Convierte un PDF/imagen a Markdown y devuelve metadatos de Marker.
+def _render_with_marker(path: Path, marker_converter: Any) -> tuple[Any, dict[str, Any]]:
+    """Ejecuta el converter recibido y conserva su salida oficial completa."""
+    rendered = marker_converter(str(path))
+    metadata = getattr(rendered, "metadata", {})
+    if isinstance(rendered, dict):
+        metadata = rendered.get("metadata", metadata)
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return rendered, metadata
 
-    Marker incluye `metadata["page_stats"]` con `text_extraction_method` por
-    página. Ese dato se usa para saber si una página acabó usando OCR (`surya`)
-    o texto embebido del PDF (`pdftext`).
-    """
+
+def _marker_markdown_text(rendered: Any) -> str:
+    """Obtiene texto del renderer Markdown oficial para el flag de compatibilidad."""
     try:
         from marker.output import text_from_rendered
     except ImportError as exc:
@@ -456,14 +464,150 @@ def _render_with_marker(path: Path, marker_converter: Any) -> tuple[str, dict[st
             "marker.output.text_from_rendered. Reinstala/actualiza marker-pdf."
         ) from exc
 
-    rendered = marker_converter(str(path))
     text, _, _images = text_from_rendered(rendered)
-    metadata = getattr(rendered, "metadata", {})
-    if not isinstance(metadata, dict):
-        metadata = {}
-    if not isinstance(text, str):
-        return "", metadata
-    return text, metadata
+    return text if isinstance(text, str) else ""
+
+
+def _to_plain_data(value: Any) -> Any:
+    """Convierte modelos Pydantic de Marker a tipos JSON sin conocer sus clases."""
+    if hasattr(value, "model_dump"):
+        try:
+            dumped_value = value.model_dump(mode="json")
+        except TypeError:
+            dumped_value = value.model_dump()
+        return _to_plain_data(dumped_value)
+    if isinstance(value, dict):
+        return {str(key): _to_plain_data(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain_data(item) for item in value]
+    return value
+
+
+def _block_page_number(block: dict[str, Any], inherited_page: int | None = None) -> int:
+    """Obtiene página humana 1-based desde campos o IDs públicos de Marker."""
+    for key in ("page_id", "page"):
+        if key in block:
+            page_number = _as_1_based_page_number(block.get(key))
+            if page_number is not None:
+                return page_number
+
+    block_id = str(block.get("id", ""))
+    match = re.search(r"(?:^|/)page/(\d+)(?:/|$)", block_id, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1)) + 1
+    return inherited_page or 1
+
+
+def _text_from_marker_block(block: dict[str, Any]) -> str:
+    """Deriva texto indexable sin perder la estructura JSON original."""
+    direct_text = block.get("text")
+    if isinstance(direct_text, str) and direct_text.strip():
+        return _normalize_text(direct_text)
+
+    direct_html = block.get("html")
+    if isinstance(direct_html, str) and direct_html.strip():
+        without_tags = re.sub(r"<[^>]+>", " ", direct_html)
+        normalized_html_text = re.sub(
+            r"[ \t]+",
+            " ",
+            html_lib.unescape(without_tags),
+        )
+        return _normalize_text(normalized_html_text)
+
+    child_texts = [
+        _text_from_marker_block(child)
+        for child in block.get("children", [])
+        if isinstance(child, dict)
+    ]
+    return _normalize_text("\n\n".join(text for text in child_texts if text))
+
+
+def _page_extraction_metadata(metadata: dict[str, Any], page_number: int) -> dict[str, Any]:
+    """Conserva metadata general y la estadística correspondiente a la página."""
+    page_stats = metadata.get("page_stats")
+    selected_page_stats: list[dict[str, Any]] = []
+    if isinstance(page_stats, list):
+        for page_stat in page_stats:
+            if not isinstance(page_stat, dict):
+                continue
+            if _as_1_based_page_number(page_stat.get("page_id")) == page_number:
+                selected_page_stats.append(dict(page_stat))
+
+    extraction_metadata = {
+        key: _to_plain_data(value)
+        for key, value in metadata.items()
+        if key != "page_stats"
+    }
+    if selected_page_stats:
+        extraction_metadata["page_stats"] = selected_page_stats
+    return extraction_metadata
+
+
+def _extract_marker_structured_chunks(
+    rendered: Any,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Normaliza la salida JSON oficial al contrato estructurado del RAG."""
+    payload = _to_plain_data(rendered)
+    if not isinstance(payload, dict):
+        return []
+
+    effective_metadata = dict(metadata or {})
+    payload_metadata = payload.get("metadata")
+    if isinstance(payload_metadata, dict):
+        effective_metadata.update(payload_metadata)
+
+    root_children = payload.get("children")
+    candidates = (
+        [child for child in root_children if isinstance(child, dict)]
+        if isinstance(root_children, list)
+        else [payload]
+    )
+
+    page_candidates = [
+        block
+        for block in candidates
+        if str(block.get("block_type", "")).strip().lower() == "page"
+    ]
+    blocks = page_candidates or candidates
+    structured_chunks: list[dict[str, Any]] = []
+
+    for block in blocks:
+        page_number = _block_page_number(block)
+        children = block.get("children")
+        plain_children = (
+            [_to_plain_data(child) for child in children]
+            if isinstance(children, list)
+            else []
+        )
+        polygon = _to_plain_data(block.get("polygon") or [])
+        if isinstance(polygon, dict):
+            polygon = polygon.get("polygon", [])
+        if not isinstance(polygon, list):
+            polygon = []
+
+        section_hierarchy = _to_plain_data(block.get("section_hierarchy") or {})
+        if not isinstance(section_hierarchy, dict):
+            section_hierarchy = {}
+
+        structured_chunks.append(
+            {
+                "block_type": str(block.get("block_type") or "Unknown"),
+                "id": str(block.get("id") or ""),
+                "html": str(block.get("html") or ""),
+                "text": _text_from_marker_block(block),
+                "page": page_number,
+                "polygon": polygon,
+                "children": plain_children,
+                "section_hierarchy": section_hierarchy,
+                "extraction_metadata": _page_extraction_metadata(
+                    effective_metadata,
+                    page_number,
+                ),
+            }
+        )
+
+    return structured_chunks
 
 
 def _extract_marker_ocr_usage_by_page(metadata: dict[str, Any]) -> dict[int, bool]:
@@ -544,25 +688,46 @@ def _marker_document_pages(
     path: Path,
     source_type: str,
     marker_converter: Any,
+    settings: Settings,
     default_ocr_used: bool = False,
 ) -> list[PageDocument]:
-    """Adapto cualquier salida paginada de Marker 2 a `PageDocument`."""
+    """Adapta JSON estructurado o el Markdown temporal a `PageDocument`."""
     try:
-        markdown, metadata = _render_with_marker(path, marker_converter)
+        rendered, metadata = _render_with_marker(path, marker_converter)
     except Exception as exc:
         raise RuntimeError(f"Marker falló procesando '{path.name}': {exc}") from exc
 
-    page_texts = _split_marker_markdown_by_page(markdown)
     marker_ocr_usage = _extract_marker_ocr_usage_by_page(metadata)
     document_ocr_used = any(marker_ocr_usage.values()) if marker_ocr_usage else default_ocr_used
 
+    if settings.marker_markdown_compatibility:
+        markdown = _marker_markdown_text(rendered)
+        structured_chunks = [
+            {
+                "block_type": "Page",
+                "id": f"/page/{page_number - 1}",
+                "html": "",
+                "text": text,
+                "page": page_number,
+                "polygon": [],
+                "children": [],
+                "section_hierarchy": {},
+                "extraction_metadata": _page_extraction_metadata(metadata, page_number),
+            }
+            for page_number, text in _split_marker_markdown_by_page(markdown)
+        ]
+    else:
+        structured_chunks = _extract_marker_structured_chunks(rendered, metadata)
+
     pages: list[PageDocument] = []
-    for page_number, text in page_texts:
+    for chunk in structured_chunks:
+        page_number = int(chunk["page"])
+        text = str(chunk["text"])
         if not text:
             continue
         ocr_used = marker_ocr_usage.get(
             page_number,
-            document_ocr_used if len(page_texts) == 1 else default_ocr_used,
+            document_ocr_used if len(structured_chunks) == 1 else default_ocr_used,
         )
         pages.append(
             PageDocument(
@@ -573,6 +738,14 @@ def _marker_document_pages(
                 page_number=page_number,
                 text=text,
                 ocr_used=ocr_used,
+                block_type=str(chunk["block_type"]),
+                id=str(chunk["id"]),
+                html=str(chunk["html"]),
+                page=page_number,
+                polygon=chunk["polygon"],
+                children=chunk["children"],
+                section_hierarchy=chunk["section_hierarchy"],
+                extraction_metadata=chunk["extraction_metadata"],
             )
         )
     return pages
@@ -591,11 +764,13 @@ def load_marker_document_pages(
     """
     converter = marker_converter or create_marker_converter(settings)
     suffix = document_path.suffix.lower()
+    profile = resolve_marker_profile(settings)
     return _marker_document_pages(
         document_path,
         source_type=suffix.lstrip("."),
         marker_converter=converter,
-        default_ocr_used=suffix in IMAGE_SUFFIXES or settings.marker_ocr_mode == "force",
+        settings=settings,
+        default_ocr_used=suffix in IMAGE_SUFFIXES and not profile.disable_ocr,
     )
 
 
@@ -728,7 +903,7 @@ def load_documents_from_directory(
                 _emit(
                     progress_callback,
                     f"Parseando {suffix.lstrip('.').upper()} con Marker 2 "
-                    f"({settings.marker_mode}): {display_path}",
+                    f"({resolve_marker_profile(settings).name}): {display_path}",
                 )
                 pages = load_marker_document_pages(
                     path,

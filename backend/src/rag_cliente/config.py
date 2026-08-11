@@ -21,6 +21,7 @@ Sergio y Juan
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -31,6 +32,75 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Carga variables de entorno desde ".env" antes de construir Settings.
 load_dotenv()
+
+
+MarkerProfileName = Literal["cpu-digital", "cpu-quality", "gpu-quality", "auto"]
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedMarkerProfile:
+    """Configuración efectiva e inmutable de un perfil oficial de Marker."""
+
+    name: Literal["cpu-digital", "cpu-quality", "gpu-quality"]
+    mode: Literal["fast", "balanced"]
+    disable_ocr: bool
+    use_llm: bool
+    torch_device: str
+    inference_backend: str | None
+
+
+_MARKER_PROFILES: dict[str, ResolvedMarkerProfile] = {
+    "cpu-digital": ResolvedMarkerProfile(
+        name="cpu-digital",
+        mode="fast",
+        disable_ocr=True,
+        use_llm=False,
+        torch_device="cpu",
+        inference_backend=None,
+    ),
+    "cpu-quality": ResolvedMarkerProfile(
+        name="cpu-quality",
+        mode="fast",
+        disable_ocr=False,
+        use_llm=True,
+        torch_device="cpu",
+        inference_backend="llamacpp",
+    ),
+    "gpu-quality": ResolvedMarkerProfile(
+        name="gpu-quality",
+        mode="balanced",
+        disable_ocr=False,
+        use_llm=True,
+        torch_device="cuda",
+        inference_backend=None,
+    ),
+}
+
+
+def has_usable_nvidia_gpu() -> bool:
+    """Detecta CUDA de forma perezosa sin hacer que la configuración dependa de ella."""
+    try:
+        import torch
+    except (ImportError, OSError):
+        return False
+
+    try:
+        return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def resolve_marker_profile(
+    settings: "Settings",
+    *,
+    cuda_available: bool | None = None,
+) -> ResolvedMarkerProfile:
+    """Resuelve `auto`; cualquier nombre explícito se conserva sin fallback."""
+    selected_profile = settings.marker_profile
+    if selected_profile == "auto":
+        usable_cuda = has_usable_nvidia_gpu() if cuda_available is None else cuda_available
+        selected_profile = "gpu-quality" if usable_cuda else "cpu-quality"
+    return _MARKER_PROFILES[selected_profile]
 
 
 class Settings(BaseSettings):
@@ -98,36 +168,25 @@ class Settings(BaseSettings):
     api_cors_allow_origins: list[str] = Field(default=["*"], alias="API_CORS_ALLOW_ORIGINS")
 
     # ===================================================================
-    # MARKER 2 - PARSER/OCR ADAPTATIVO PARA DOCUMENTOS
+    # MARKER 2 - PERFILES DEL PIPELINE OFICIAL
     # ===================================================================
     # Activo Marker full para PDF, Office, EPUB, HTML e imágenes. Si lo
     # desactivo, conservo fallbacks nativos para PDF digital, DOCX y TXT.
     marker_enabled: bool = Field(default=True, alias="MARKER_ENABLED")
 
-    # Expreso los tres comportamientos OCR con un solo valor para que yo no
-    # pueda crear combinaciones contradictorias con varios booleanos.
-    marker_ocr_mode: Literal["adaptive", "force", "disabled"] = Field(
-        default="adaptive",
-        alias="MARKER_OCR_MODE",
-    )
-
-    # Uso balanced en CUDA para que yo obtenga layout VLM, OCR adaptativo y
-    # fallback visual automático en tablas de baja confianza.
-    marker_mode: Literal["balanced", "fast"] = Field(
-        default="balanced",
-        alias="MARKER_MODE",
-    )
-
-    # Elijo el servidor VLM que usará Surya. En Windows puedo usar llama.cpp
-    # sin depender de Docker; dejo auto disponible para otros despliegues.
-    marker_inference_backend: Literal["auto", "vllm", "llamacpp"] = Field(
+    # Un perfil explícito nunca se sustituye según el hardware. Solo `auto`
+    # consulta CUDA y elige entre gpu-quality y cpu-quality.
+    marker_profile: MarkerProfileName = Field(
         default="auto",
-        alias="MARKER_INFERENCE_BACKEND",
+        alias="MARKER_PROFILE",
     )
 
-    # Si elijo llama.cpp, indico el ejecutable local para que yo pueda arrancar
-    # el servidor OCR de Surya aunque no esté registrado en PATH.
-    marker_llama_cpp_binary: str = Field(default="", alias="MARKER_LLAMA_CPP_BINARY")
+    # cpu-quality usa el backend llama.cpp de Surya. La ruta sigue siendo
+    # configurable para otros ordenadores.
+    marker_llama_cpp_binary: str = Field(
+        default=r"C:\Users\SergioMartinReizabal\Documents\llama.cpp\llama-server.exe",
+        alias="MARKER_LLAMA_CPP_BINARY",
+    )
 
     # Mantengo el umbral oficial de balanced como segunda red de seguridad para
     # tablas que lleguen al TableProcessor sin promover antes toda su página.
@@ -137,20 +196,9 @@ class Settings(BaseSettings):
         ge=0.0,
     )
 
-    # Promuevo a OCR completo solo las páginas cuyo layout contenga tablas,
-    # formularios o regiones complejas; así conservo contexto y orden de lectura.
-    marker_full_page_ocr_complex_layout: bool = Field(
-        default=True,
-        alias="MARKER_FULL_PAGE_OCR_COMPLEX_LAYOUT",
-    )
-
     # Elimina texto OCR existente en el PDF antes de re-OCR. Útil para documentos
     # con capa OCR mala o duplicada.
     marker_strip_existing_ocr: bool = Field(default=False, alias="MARKER_STRIP_EXISTING_OCR")
-
-    # Usa modo LLM de Marker para mejorar tablas, formularios y formato. Requiere
-    # configurar el backend LLM que soporte Marker fuera de este proyecto.
-    marker_use_llm: bool = Field(default=False, alias="MARKER_USE_LLM")
 
     # Evita guardar imágenes extraídas al disco. Para RAG textual normalmente se
     # prefiere True para no generar artefactos innecesarios.
@@ -163,13 +211,12 @@ class Settings(BaseSettings):
     # Vacío = documento completo.
     marker_page_range: str = Field(default="", alias="MARKER_PAGE_RANGE")
 
-    # El proyecto se despliega con GPU NVIDIA. Marker se fuerza a CUDA y el
-    # loader valida que PyTorch pueda verla antes de cargar los modelos.
-    marker_torch_device: Literal["cuda"] = Field(
-        default="cuda",
-        alias="MARKER_TORCH_DEVICE",
+    # La salida JSON oficial es primaria. Este flag conserva temporalmente la
+    # ruta Markdown anterior para instalaciones que aún no hayan migrado.
+    marker_markdown_compatibility: bool = Field(
+        default=False,
+        alias="MARKER_MARKDOWN_COMPATIBILITY",
     )
-
 
     model_config = SettingsConfigDict(
         populate_by_name=True,

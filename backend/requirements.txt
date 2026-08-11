@@ -1,7 +1,6 @@
 fastapi>=0.115.0
-# setup.ps1 instala este pin desde el indice oficial CUDA 13.0 de PyTorch.
-torch==2.12.1
-torchvision==0.27.1
+# PyTorch/torchvision se instalan exclusivamente en setup.ps1, donde se elige
+# de forma explícita la distribución CPU o CUDA antes de instalar este archivo.
 lancedb>=0.17.0
 langchain-text-splitters>=0.3.0
 marker-pdf[full]>=2.0.0,<3.0.0

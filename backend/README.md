@@ -2,14 +2,14 @@
 
 RAG local para indexar PDF, DOCX, PPTX, XLSX, EPUB, HTML, TXT e imágenes en
 LanceDB y consultarlos mediante CLI o una API compatible con aplicaciones web.
-Los documentos estructurados se procesan con Marker 2; PyTorch y Marker están
-configurados para una GPU NVIDIA.
+Los documentos estructurados se procesan con Marker 2 mediante perfiles para
+CPU o GPU NVIDIA.
 
 ## Requisitos
 
 - Windows
 - Conda (Miniconda o Anaconda)
-- GPU NVIDIA y driver compatible con CUDA 13
+- GPU NVIDIA y driver compatible con CUDA 13 (opcional)
 - Un endpoint de chat compatible con OpenAI
 - Un endpoint de embeddings compatible con OpenAI
 
@@ -18,14 +18,15 @@ configurados para una GPU NVIDIA.
 Desde esta carpeta:
 
 ```powershell
-.\setup.ps1
+.\setup.ps1 -Device auto  # también admite cpu o cuda
 .\rag.bat gpu
 ```
 
 `setup.ps1` crea o actualiza el entorno `rag-cliente` con Python 3.11, instala
-PyTorch 2.12.1 con CUDA 13.0, instala las dependencias y el paquete local, y
-comprueba que CUDA sea visible. La instalación falla si PyTorch no detecta la
-GPU; no se usa CPU como fallback.
+explícitamente la distribución CPU o CUDA de PyTorch 2.12.1, instala las
+dependencias y el paquete local, y valida que la variante no haya cambiado.
+`auto` elige CUDA si `nvidia-smi` detecta una GPU utilizable y CPU en caso
+contrario. `cpu` o `cuda` siempre prevalecen sobre esa detección.
 
 ## Configuración
 
@@ -35,7 +36,7 @@ Copia `.env.example` como `.env` y ajusta, como mínimo:
 LLAMA_CPP_CHAT_BASE_URL=http://127.0.0.1:8081/v1
 LLAMA_CPP_EMBEDDING_BASE_URL=http://127.0.0.1:8082/v1
 OPENAI_API_KEY=local-dev-key
-MARKER_TORCH_DEVICE=cuda
+MARKER_PROFILE=auto
 ```
 
 Las opciones principales de almacenamiento y recuperación son:
@@ -52,42 +53,23 @@ VECTOR_WEIGHT=0.65
 BM25_WEIGHT=0.35
 ```
 
-Marker 2 se controla con `MARKER_ENABLED`, `MARKER_MODE`, `MARKER_OCR_MODE`,
-`MARKER_STRIP_EXISTING_OCR`,
-`MARKER_USE_LLM`, `MARKER_DISABLE_IMAGE_EXTRACTION` y `MARKER_PAGE_RANGE`.
+Marker 2 se controla principalmente con `MARKER_ENABLED`, `MARKER_PROFILE`,
+`MARKER_STRIP_EXISTING_OCR`, `MARKER_DISABLE_IMAGE_EXTRACTION` y
+`MARKER_PAGE_RANGE`.
 
-La configuración recomendada para GPU es:
+Los perfiles son:
 
-```env
-MARKER_MODE=balanced
-MARKER_OCR_MODE=adaptive
-MARKER_INFERENCE_BACKEND=auto
-MARKER_LLAMA_CPP_BINARY=
-MARKER_FULL_PAGE_OCR_COMPLEX_LAYOUT=true
-MARKER_TABLE_MIN_RECON_SCORE=0.75
-```
+- `cpu-digital`: `fast`, OCR deshabilitado y sin LLM.
+- `cpu-quality`: `fast`, OCR Surya mediante llama.cpp y LLM habilitado.
+- `gpu-quality`: `balanced`, OCR Surya con CUDA y LLM habilitado.
+- `auto`: `gpu-quality` con CUDA utilizable y `cpu-quality` en caso contrario.
 
-En este modo Marker 2 conserva la capa digital cuando es fiable y activa el
-procesamiento visual de forma selectiva para páginas escaneadas, bloques
-defectuosos y tablas de baja confianza. Los valores `force` y `disabled` quedan
-como overrides de diagnóstico; el funcionamiento normal usa `adaptive`.
-
-El modo `balanced` necesita un servidor VLM de Surya. En Linux/CUDA, `auto`
-puede arrancar vLLM mediante Docker. En Windows se puede evitar Docker usando:
-
-```env
-MARKER_INFERENCE_BACKEND=llamacpp
-MARKER_LLAMA_CPP_BINARY=D:\ruta\a\llama-server.exe
-```
-
-La primera ejecución descarga el modelo GGUF de Surya 2 a la caché del usuario.
-Si se selecciona `vllm`, Docker Desktop debe estar iniciado antes de indexar.
-
-`MARKER_FULL_PAGE_OCR_COMPLEX_LAYOUT=true` conserva `pdftext` en páginas
-sencillas y promueve a OCR completo solo las páginas donde el layout detecta
-`Table`, `Form` o `ComplexRegion`. El OCR recibe así el contexto global que
-necesita para ordenar columnas paralelas. `MARKER_TABLE_MIN_RECON_SCORE=0.75`
-queda como fallback secundario del procesador de tablas de Marker 2.
+Marker usa salida JSON estructurada por defecto. Para conservar temporalmente
+el Markdown paginado anterior se puede definir
+`MARKER_MARKDOWN_COMPATIBILITY=true`. La conexión al VLM local para los
+perfiles quality se implementará en una fase posterior; hasta entonces esos
+perfiles fallan antes de cargar modelos para impedir el servicio Gemini
+predeterminado de Marker.
 
 ## Uso
 
@@ -184,9 +166,9 @@ backend/
 
 ## Diagnóstico
 
-Si CUDA no está disponible, ejecuta otra vez `setup.ps1` y después
-`rag.bat gpu`. Con `MARKER_TORCH_DEVICE=cuda`, el indexador se detiene con un
-mensaje explícito si PyTorch no detecta la GPU.
+Si CUDA no está disponible, ejecuta `setup.ps1 -Device cpu`. Si seleccionas
+`MARKER_PROFILE=gpu-quality`, el indexador se detiene con un mensaje explícito
+si PyTorch no detecta la GPU; nunca cambia silenciosamente a CPU.
 
 Si LanceDB indica que no existe `pdf_chunks`, añade documentos y ejecuta
 `rag.bat index`. Si un endpoint devuelve timeout, aumenta `REQUEST_TIMEOUT` en

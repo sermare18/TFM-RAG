@@ -7,18 +7,20 @@ import importlib
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # El otro módulo de pruebas instala dobles ligeros para FastAPI. Yo retiro solo
 # el doble del loader para comprobar aquí la implementación real de Marker.
 sys.modules.pop("rag_cliente.pdf_loader", None)
 importlib.invalidate_caches()
 
-from rag_cliente.config import Settings
+from rag_cliente.config import Settings, resolve_marker_profile
+import rag_cliente.pdf_loader as pdf_loader
 from rag_cliente.pdf_loader import (
     PageDocument,
     _build_marker_config,
     _collect_marker_page_extraction_details,
+    _extract_marker_structured_chunks,
     _install_surya_windows_cleanup_workaround,
     _require_marker_2,
     _split_marker_markdown_by_page,
@@ -28,58 +30,139 @@ from rag_cliente.pdf_loader import (
 
 
 class Marker2ConfigurationTests(unittest.TestCase):
-    def test_balanced_mode_keeps_ocr_adaptive_by_default(self) -> None:
-        config = _build_marker_config(Settings())
+    def test_explicit_profiles_have_exact_marker_values(self) -> None:
+        expected = {
+            "cpu-digital": ("fast", True, False, "cpu", None),
+            "cpu-quality": ("fast", False, True, "cpu", "llamacpp"),
+            "gpu-quality": ("balanced", False, True, "cuda", None),
+        }
 
-        self.assertEqual(config["mode"], "balanced")
-        self.assertFalse(config["disable_ocr"])
-        self.assertEqual(config["min_recon_score"], 0.75)
-        self.assertTrue(config["force_ocr_complex_layout"])
-        self.assertNotIn("force_ocr", config)
+        for profile_name, values in expected.items():
+            with self.subTest(profile=profile_name):
+                profile = resolve_marker_profile(
+                    Settings(marker_profile=profile_name),
+                    cuda_available=profile_name == "gpu-quality",
+                )
+                config = _build_marker_config(
+                    Settings(marker_profile=profile_name),
+                    profile,
+                )
 
-    def test_single_ocr_mode_maps_to_marker_flags(self) -> None:
-        adaptive = _build_marker_config(Settings(marker_ocr_mode="adaptive"))
-        forced = _build_marker_config(Settings(marker_ocr_mode="force"))
-        disabled = _build_marker_config(Settings(marker_ocr_mode="disabled"))
+                self.assertEqual(
+                    (
+                        config["mode"],
+                        config["disable_ocr"],
+                        config["use_llm"],
+                        profile.torch_device,
+                        profile.inference_backend,
+                    ),
+                    values,
+                )
 
-        self.assertFalse(adaptive["disable_ocr"])
-        self.assertNotIn("force_ocr", adaptive)
-        self.assertTrue(forced["force_ocr"])
-        self.assertFalse(forced["disable_ocr"])
-        self.assertTrue(disabled["disable_ocr"])
-        self.assertNotIn("force_ocr", disabled)
+    def test_auto_selects_cpu_without_cuda_and_gpu_with_cuda(self) -> None:
+        settings = Settings(marker_profile="auto")
+
+        self.assertEqual(
+            resolve_marker_profile(settings, cuda_available=False).name,
+            "cpu-quality",
+        )
+        self.assertEqual(
+            resolve_marker_profile(settings, cuda_available=True).name,
+            "gpu-quality",
+        )
+
+    def test_explicit_profile_always_precedes_hardware_detection(self) -> None:
+        cpu_profile = resolve_marker_profile(
+            Settings(marker_profile="cpu-digital"),
+            cuda_available=True,
+        )
+        gpu_profile = resolve_marker_profile(
+            Settings(marker_profile="gpu-quality"),
+            cuda_available=False,
+        )
+
+        self.assertEqual(cpu_profile.name, "cpu-digital")
+        self.assertEqual(gpu_profile.name, "gpu-quality")
+
+    def test_configuration_loads_without_torch_or_cuda(self) -> None:
+        with patch.dict(sys.modules, {"torch": None}):
+            settings = Settings(marker_profile="cpu-digital")
+            config = _build_marker_config(settings)
+            auto_profile = resolve_marker_profile(Settings(marker_profile="auto"))
+
+        self.assertEqual(config["mode"], "fast")
+        self.assertTrue(config["disable_ocr"])
+        self.assertEqual(auto_profile.name, "cpu-quality")
+
+    def test_json_is_primary_and_markdown_requires_compatibility_flag(self) -> None:
+        json_config = _build_marker_config(Settings(marker_profile="cpu-digital"))
+        markdown_config = _build_marker_config(
+            Settings(
+                marker_profile="cpu-digital",
+                marker_markdown_compatibility=True,
+            )
+        )
+
+        self.assertEqual(json_config["output_format"], "json")
+        self.assertFalse(json_config["paginate_output"])
+        self.assertEqual(markdown_config["output_format"], "markdown")
+        self.assertTrue(markdown_config["paginate_output"])
+
+    def test_no_custom_marker_line_builder_remains(self) -> None:
+        source = Path(pdf_loader.__file__).read_text(encoding="utf-8")
+        forbidden_builder = "LayoutAware" + "LineBuilder"
+
+        self.assertNotIn(forbidden_builder, source)
+        self.assertNotIn("from marker.builders.line import", source)
+        self.assertNotIn("line_builder_class", source)
 
     def test_marker_2_version_is_required(self) -> None:
         with patch("rag_cliente.pdf_loader.version", return_value="1.10.2"):
             with self.assertRaisesRegex(RuntimeError, "requiere marker-pdf 2.x"):
                 _require_marker_2()
 
-    def test_missing_llama_cpp_binary_is_reported_before_model_start(self) -> None:
-        settings = Settings(
-            marker_inference_backend="llamacpp",
-            marker_llama_cpp_binary="Z:/missing/llama-server.exe",
-        )
+    def test_quality_profile_fails_before_marker_without_local_vlm_endpoint(self) -> None:
+        settings = Settings(marker_profile="cpu-quality")
 
-        with patch("rag_cliente.pdf_loader._require_marker_2", return_value="2.0.0"):
-            with self.assertRaisesRegex(RuntimeError, "no existe"):
+        with patch("rag_cliente.pdf_loader._require_marker_2") as marker_version:
+            with self.assertRaisesRegex(RuntimeError, "endpoint VLM local válido"):
                 create_marker_converter(settings)
+
+        marker_version.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Este ajuste solo se aplica en Windows")
     def test_windows_cleanup_targets_only_the_spawned_server_pid(self) -> None:
-        from surya.inference.backends import spawn as surya_spawn
-
-        original_stop_process = surya_spawn._stop_process
+        surya_module = types.ModuleType("surya")
+        inference_module = types.ModuleType("surya.inference")
+        backends_module = types.ModuleType("surya.inference.backends")
+        spawn_module = types.ModuleType("surya.inference.backends.spawn")
+        spawn_module._stop_process = lambda pid, name: None
+        spawn_module.logger = Mock()
+        backends_module.spawn = spawn_module
         completed = types.SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
-        try:
-            with patch("rag_cliente.pdf_loader.subprocess.run", return_value=completed) as taskkill:
-                _install_surya_windows_cleanup_workaround()
-                surya_spawn._stop_process(12345, "llamacpp")
 
-            # Compruebo que cierro únicamente el árbol del PID creado por Surya.
-            self.assertEqual(taskkill.call_args.args[0][:4], ["taskkill", "/PID", "12345", "/T"])
-            self.assertIn("/F", taskkill.call_args.args[0])
-        finally:
-            surya_spawn._stop_process = original_stop_process
+        fake_modules = {
+            "surya": surya_module,
+            "surya.inference": inference_module,
+            "surya.inference.backends": backends_module,
+            "surya.inference.backends.spawn": spawn_module,
+        }
+        with (
+            patch.dict(sys.modules, fake_modules),
+            patch("rag_cliente.pdf_loader.subprocess.run", return_value=completed) as taskkill,
+        ):
+            _install_surya_windows_cleanup_workaround()
+            spawn_module._stop_process(12345, "llamacpp")
+
+        # Compruebo que cierro únicamente el árbol del PID creado por Surya.
+        self.assertEqual(taskkill.call_args.args[0][:4], ["taskkill", "/PID", "12345", "/T"])
+        self.assertIn("/F", taskkill.call_args.args[0])
+
+    def test_setup_accepts_auto_cpu_cuda_and_keeps_editable_install_dependency_free(self) -> None:
+        setup_source = (Path(__file__).parents[1] / "setup.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('[ValidateSet("auto", "cpu", "cuda")]', setup_source)
+        self.assertIn("pip install -e $ProjectRoot --no-deps", setup_source)
 
 
 class Marker2MetadataTests(unittest.TestCase):
@@ -103,6 +186,52 @@ class Marker2MetadataTests(unittest.TestCase):
         markdown = "{17}" + "-" * 48 + "\n\ncontenido"
 
         self.assertEqual(_split_marker_markdown_by_page(markdown), [(18, "contenido")])
+
+    def test_json_output_keeps_required_structured_fields(self) -> None:
+        rendered = {
+            "block_type": "Document",
+            "metadata": {
+                "document_type": "pdf",
+                "page_stats": [{"page_id": 0, "ocr_used": True}],
+            },
+            "children": [
+                {
+                    "block_type": "Page",
+                    "id": "/page/0/Page/0",
+                    "html": "<p>Texto <strong>útil</strong></p>",
+                    "polygon": [[0, 0], [100, 0], [100, 200], [0, 200]],
+                    "children": [
+                        {
+                            "block_type": "Text",
+                            "id": "/page/0/Text/0",
+                            "text": "Texto útil",
+                        }
+                    ],
+                    "section_hierarchy": {"1": "Introducción"},
+                }
+            ],
+        }
+
+        chunks = _extract_marker_structured_chunks(rendered)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(
+            set(chunks[0]),
+            {
+                "block_type",
+                "id",
+                "html",
+                "text",
+                "page",
+                "polygon",
+                "children",
+                "section_hierarchy",
+                "extraction_metadata",
+            },
+        )
+        self.assertEqual(chunks[0]["page"], 1)
+        self.assertEqual(chunks[0]["text"], "Texto útil")
+        self.assertTrue(chunks[0]["extraction_metadata"]["page_stats"][0]["ocr_used"])
 
 
 class GenericMarkerDocumentTests(unittest.TestCase):
