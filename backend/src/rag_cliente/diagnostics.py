@@ -6,7 +6,11 @@ import shutil
 from importlib.util import find_spec
 from pathlib import Path
 
-from rag_cliente.config import Settings, resolve_local_model_profile
+from rag_cliente.config import (
+    CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
+    Settings,
+    resolve_local_model_profile,
+)
 from rag_cliente.local_endpoints import is_local_model_endpoint
 from rag_cliente.model_manifest import check_models
 from rag_cliente.model_supervisor import detect_hardware
@@ -32,6 +36,9 @@ def run_doctor(settings: Settings) -> dict:
     )
     bedrock_configured = bool(
         settings.aws_region.strip() and settings.bedrock_model_id.strip()
+    )
+    global_claude_profile = (
+        settings.bedrock_model_id.strip() == CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID
     )
     boto3_installed = find_spec("boto3") is not None
 
@@ -82,6 +89,12 @@ def run_doctor(settings: Settings) -> dict:
             "detail": "instalado" if boto3_installed else "ejecuta setup.ps1",
         },
         {
+            "name": "bedrock_global_claude_profile",
+            "ok": global_claude_profile,
+            "required": settings.bedrock_enabled,
+            "detail": settings.bedrock_model_id or "[sin configurar]",
+        },
+        {
             "name": "bedrock_pages_per_batch",
             "ok": settings.bedrock_pages_per_batch == 4,
             "detail": str(settings.bedrock_pages_per_batch),
@@ -100,6 +113,7 @@ def run_doctor(settings: Settings) -> dict:
             "enabled": settings.bedrock_enabled,
             "configured": bedrock_configured,
             "boto3_installed": boto3_installed,
+            "global_claude_profile": global_claude_profile,
             "pages_per_batch": settings.bedrock_pages_per_batch,
             "cache_dir": str(settings.bedrock_cache_path),
             "network_checked": False,

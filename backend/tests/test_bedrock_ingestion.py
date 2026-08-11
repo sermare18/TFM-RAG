@@ -11,7 +11,7 @@ from rag_cliente.bedrock_parser import (
     MarkdownDocument,
     MarkdownPage,
 )
-from rag_cliente.config import Settings
+from rag_cliente.config import CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID, Settings
 from rag_cliente.indexer import MarkdownChunker
 
 
@@ -22,12 +22,22 @@ class FakeBedrockClient:
     def converse(self, **kwargs):
         self.calls.append(kwargs)
         content = kwargs["messages"][0]["content"]
-        pages = []
+        markdown_pages = []
         for item in content:
             text = item.get("text", "") if isinstance(item, dict) else ""
             if text.startswith("PAGE ") and " IMAGE" in text:
                 page = int(text.split()[1])
-                pages.append({"page": page, "markdown": f"# Pagina {page}\n\n| A | B |\n|---|---|\n| {page} | dato |"})
+                markdown_pages.append(
+                    f"# Pagina {page}\n\n| A | B |\n|---|---|\n| {page} | dato |"
+                )
+        pages = {
+            f"slot_{index}": (
+                markdown_pages[index - 1]
+                if index <= len(markdown_pages)
+                else None
+            )
+            for index in range(1, 5)
+        }
         return {
             "output": {
                 "message": {
@@ -59,14 +69,43 @@ class DailyQuotaClient:
         raise DailyQuotaError()
 
 
+class MinuteQuotaError(RuntimeError):
+    response = {
+        "Error": {
+            "Code": "ThrottlingException",
+            "Message": "Too many tokens per minute, please wait before trying again.",
+        }
+    }
+
+
+class MinuteQuotaClient:
+    def converse(self, **_kwargs):
+        raise MinuteQuotaError()
+
+
+class InferenceProfileError(RuntimeError):
+    response = {
+        "Error": {
+            "Code": "ValidationException",
+            "Message": "Use of this model requires an inference profile.",
+        }
+    }
+
+
+class InferenceProfileClient:
+    def converse(self, **_kwargs):
+        raise InferenceProfileError()
+
+
 class BedrockParserTests(unittest.TestCase):
     def make_settings(self, cache: Path, *, enabled: bool = True) -> Settings:
         return Settings(
             bedrock_enabled=enabled,
             aws_region="eu-west-1",
-            bedrock_model_id="test-model",
+            bedrock_model_id=CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
             bedrock_cache_dir=str(cache),
             bedrock_pages_per_batch=4,
+            bedrock_max_output_tokens=16384,
             model_supervision_enabled=False,
         )
 
@@ -91,6 +130,50 @@ class BedrockParserTests(unittest.TestCase):
                 for call in client.calls
             ]
             self.assertEqual(image_counts, [4, 1])
+            self.assertEqual(
+                client.calls[0]["modelId"],
+                CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
+            )
+            self.assertEqual(
+                client.calls[0]["inferenceConfig"]["maxTokens"],
+                16384,
+            )
+            output_schema = json.loads(
+                client.calls[0]["outputConfig"]["textFormat"]["structure"]
+                ["jsonSchema"]["schema"]
+            )
+            self.assertEqual(output_schema["required"], ["pages"])
+            self.assertFalse(output_schema["additionalProperties"])
+            page_schema = output_schema["properties"]["pages"]
+            self.assertEqual(
+                page_schema["required"],
+                ["slot_1", "slot_2", "slot_3", "slot_4"],
+            )
+            self.assertFalse(page_schema["additionalProperties"])
+            self.assertEqual(
+                page_schema["properties"]["slot_1"],
+                {"type": "string"},
+            )
+            self.assertEqual(
+                page_schema["properties"]["slot_4"],
+                {"type": "string"},
+            )
+            final_output_schema = json.loads(
+                client.calls[1]["outputConfig"]["textFormat"]["structure"]
+                ["jsonSchema"]["schema"]
+            )
+            final_page_schema = final_output_schema["properties"]["pages"]
+            self.assertEqual(
+                final_page_schema["properties"]["slot_1"],
+                {"type": "string"},
+            )
+            self.assertEqual(
+                final_page_schema["properties"]["slot_2"],
+                {"type": "null"},
+            )
+            request_text = client.calls[1]["messages"][0]["content"][0]["text"]
+            self.assertIn('"slot_1":5', request_text)
+            self.assertIn('"slot_2":null', request_text)
             self.assertIn("primary and authoritative", BEDROCK_SYSTEM_PROMPT)
             first_content = client.calls[0]["messages"][0]["content"]
             self.assertTrue(any("<reference_text" in block.get("text", "") for block in first_content))
@@ -162,6 +245,37 @@ class BedrockParserTests(unittest.TestCase):
             parser._render_pdf = lambda _source: [(1, b"png", "reference")]
 
             with self.assertRaisesRegex(RuntimeError, "cuota diaria"):
+                parser.parse_pdf(source)
+
+    def test_minute_quota_error_preserves_completed_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "document.pdf"
+            source.write_bytes(b"synthetic-pdf")
+            parser = BedrockMarkdownParser(
+                self.make_settings(root / "cache"),
+                MinuteQuotaClient(),
+            )
+            parser._render_pdf = lambda _source: [(1, b"png", "reference")]
+
+            with self.assertRaisesRegex(RuntimeError, "tokens por minuto"):
+                parser.parse_pdf(source)
+
+    def test_inference_profile_error_shows_the_required_global_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "document.pdf"
+            source.write_bytes(b"synthetic-pdf")
+            parser = BedrockMarkdownParser(
+                self.make_settings(root / "cache"),
+                InferenceProfileClient(),
+            )
+            parser._render_pdf = lambda _source: [(1, b"png", "reference")]
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
+            ):
                 parser.parse_pdf(source)
 
     def test_pdf_without_cache_fails_before_any_call_when_disabled(self) -> None:

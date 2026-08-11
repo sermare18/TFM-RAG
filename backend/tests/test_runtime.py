@@ -9,7 +9,7 @@ from rag_cliente.bedrock_parser import MarkdownDocument, MarkdownPage
 from rag_cliente.bm25_store import BM25Store
 from rag_cliente.config import Settings
 from rag_cliente.indexer import ChunkRecord
-from rag_cliente.model_manifest import check_models, roles_for_profile
+from rag_cliente.model_manifest import check_models, get_role, roles_for_profile
 from rag_cliente.model_supervisor import ModelServerSpec, ModelSupervisor, build_server_specs
 from rag_cliente.pipeline import RagPipeline
 from rag_cliente.resource_coordinator import ResourceCoordinator
@@ -50,6 +50,12 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(
             [role.key for role in roles_for_profile("gpu")],
             ["embeddings", "chat_gpu"],
+        )
+        gpu_chat = get_role("chat_gpu")
+        self.assertEqual(gpu_chat.directory, "qwen3-vl-8b")
+        self.assertEqual(
+            gpu_chat.patterns[0],
+            "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
         )
 
     def test_model_check_accepts_gguf_headers_without_loading(self) -> None:

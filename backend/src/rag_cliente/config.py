@@ -16,6 +16,8 @@ load_dotenv()
 LocalModelProfile = Literal["cpu", "gpu", "auto"]
 ModelServerMode = Literal["managed", "external"]
 
+CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
+
 
 def has_usable_nvidia_gpu() -> bool:
     """Detecta una NVIDIA mediante nvidia-smi sin cargar librerias de modelos."""
@@ -107,7 +109,10 @@ class Settings(BaseSettings):
     bedrock_enabled: bool = Field(default=False, alias="BEDROCK_ENABLED")
     aws_profile: str = Field(default="", alias="AWS_PROFILE")
     aws_region: str = Field(default="", alias="AWS_REGION")
-    bedrock_model_id: str = Field(default="", alias="BEDROCK_MODEL_ID")
+    bedrock_model_id: str = Field(
+        default=CLAUDE_SONNET_4_6_GLOBAL_MODEL_ID,
+        alias="BEDROCK_MODEL_ID",
+    )
     bedrock_pages_per_batch: int = Field(
         default=4,
         alias="BEDROCK_PAGES_PER_BATCH",
@@ -119,9 +124,10 @@ class Settings(BaseSettings):
         le=300,
     )
     bedrock_max_output_tokens: int = Field(
-        default=8192,
+        default=16384,
         alias="BEDROCK_MAX_OUTPUT_TOKENS",
         ge=256,
+        le=64000,
     )
     bedrock_max_pages_per_document: int = Field(
         default=200,
@@ -150,7 +156,7 @@ class Settings(BaseSettings):
         ge=0,
     )
     bedrock_prompt_version: str = Field(
-        default="page-markdown-v1",
+        default="claude-sonnet-4-6-page-markdown-v1",
         alias="BEDROCK_PROMPT_VERSION",
     )
     bedrock_cache_dir: str = Field(

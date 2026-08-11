@@ -50,12 +50,12 @@ MODEL_MANIFEST: tuple[ModelRoleSpec, ...] = (
     ),
     ModelRoleSpec(
         key="chat_gpu",
-        label="Chat GPU Qwen3.5 9B",
-        repository="bartowski/Qwen_Qwen3.5-9B-GGUF",
-        directory="qwen3.5-9b",
+        label="Chat GPU Qwen3-VL 8B",
+        repository="Qwen/Qwen3-VL-8B-Instruct-GGUF",
+        directory="qwen3-vl-8b",
         quantization="Q4_K_M",
-        patterns=("Qwen_Qwen3.5-9B-Q4_K_M.gguf", "*Q4_K_M*.gguf"),
-        expected_size="aprox. 5-7 GiB",
+        patterns=("Qwen3VL-8B-Instruct-Q4_K_M.gguf", "*Q4_K_M*.gguf"),
+        expected_size="aprox. 4.5-5.5 GiB",
         profiles=("gpu",),
     ),
 )
