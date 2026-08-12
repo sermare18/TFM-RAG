@@ -210,6 +210,10 @@ class Settings(BaseSettings):
 
     data_dir: str = Field(default="./data", alias="DATA_DIR")
     documents_dir: str = Field(default="./data/pdfs", alias="DOCUMENTS_DIR")
+    evaluation_db: str = Field(
+        default="./data/evaluation.sqlite",
+        alias="EVALUATION_DB",
+    )
     api_cors_allow_origins: list[str] = Field(
         default=["*"],
         alias="API_CORS_ALLOW_ORIGINS",
@@ -253,6 +257,10 @@ class Settings(BaseSettings):
     @property
     def documents_path(self) -> Path:
         return Path(self.documents_dir)
+
+    @property
+    def evaluation_db_path(self) -> Path:
+        return Path(self.evaluation_db)
 
     @property
     def models_path(self) -> Path:

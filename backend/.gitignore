@@ -20,6 +20,9 @@ data/markdown/
 # Índice BM25
 data/bm25/
 
+# Dataset y resultados locales del evaluador
+data/evaluation.sqlite*
+
 # Python generado
 __pycache__/
 *.py[cod]

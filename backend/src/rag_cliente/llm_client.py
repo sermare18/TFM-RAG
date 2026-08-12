@@ -11,6 +11,8 @@ from openai import OpenAI
 
 ProgressCallback = Callable[[str], None]
 
+QUERY_AUGMENTATION_PROMPT_VERSION = "query-augmentation-v1"
+
 from rag_cliente.config import Settings
 from rag_cliente.local_endpoints import is_local_model_endpoint
 
@@ -67,6 +69,7 @@ class LlamaCppClient:
         texts: list[str],
         progress_callback: ProgressCallback | None = None,
         query_mode: bool = False,
+        use_query_instruction: bool | None = None,
     ) -> list[list[float]]:
         """Genera embeddings para una lista de textos en lotes pequeños."""
         if not texts:
@@ -74,7 +77,12 @@ class LlamaCppClient:
 
         prepared_texts = texts
         instruction = self.settings.embedding_query_instruction.strip()
-        if query_mode and instruction:
+        instruction_enabled = (
+            bool(instruction)
+            if use_query_instruction is None
+            else use_query_instruction and bool(instruction)
+        )
+        if query_mode and instruction_enabled:
             prepared_texts = [
                 f"Instruct: {instruction}\nQuery: {text}" for text in texts
             ]
@@ -101,6 +109,30 @@ class LlamaCppClient:
             embeddings.extend(item.embedding for item in response.data)
 
         return embeddings
+
+    def generate_query_variants(self, question: str) -> list[str]:
+        """Genera dos consultas equivalentes para un experimento de retrieval."""
+        normalized_question = question.strip()
+        if not normalized_question:
+            raise ValueError("La pregunta no puede estar vacia.")
+        response = self.chat_client.chat.completions.create(
+            model=self.settings.default_endpoint_model,
+            temperature=0.0,
+            max_tokens=min(self.settings.max_tokens, 256),
+            messages=self._build_query_augmentation_messages(normalized_question),
+            extra_body=self._thinking_extra_body(False),
+        )
+        content = getattr(response.choices[0].message, "content", None)
+        variants = self._parse_query_variants(
+            normalized_question,
+            content if isinstance(content, str) else "",
+        )
+        if len(variants) != 2:
+            raise RuntimeError(
+                "El modelo local no devolvio dos reformulaciones validas. "
+                "Revisa el modelo o el prompt de query augmentation."
+            )
+        return variants
 
     def rewrite_question_for_retrieval(
         self,
@@ -387,6 +419,42 @@ class LlamaCppClient:
         return list(dict.fromkeys(re.findall(r"\bS\d+\b", normalized)))
 
     @staticmethod
+    def _parse_query_variants(question: str, content: str) -> list[str]:
+        """Acepta JSON estricto y listas simples sin perder reproducibilidad."""
+        normalized = content.strip()
+        candidates: list[str] = []
+        json_candidates = [normalized]
+        json_match = re.search(r"(?:\{.*\}|\[.*\])", normalized, flags=re.DOTALL)
+        if json_match and json_match.group(0) != normalized:
+            json_candidates.append(json_match.group(0))
+        for candidate in json_candidates:
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            value = payload.get("queries") if isinstance(payload, dict) else payload
+            if isinstance(value, list):
+                candidates.extend(str(item).strip() for item in value)
+                break
+        if not candidates:
+            candidates.extend(
+                re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip(" \t\"'")
+                for line in normalized.splitlines()
+            )
+
+        variants: list[str] = []
+        original = question.strip().casefold()
+        for candidate in candidates:
+            cleaned = " ".join(candidate.split())
+            if not cleaned or cleaned.casefold() == original:
+                continue
+            if cleaned.casefold() not in {item.casefold() for item in variants}:
+                variants.append(cleaned)
+            if len(variants) == 2:
+                break
+        return variants
+
+    @staticmethod
     def _normalize_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
         """Filtra y normaliza mensajes con role/content validos."""
         normalized = []
@@ -429,6 +497,22 @@ class LlamaCppClient:
                     f"Latest question: {question}"
                 ),
             },
+        ]
+
+    @staticmethod
+    def _build_query_augmentation_messages(question: str) -> list[dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You generate search-query variants for a RAG retriever. "
+                    "Return exactly two concise reformulations that preserve the "
+                    "meaning and language of the original question. Do not answer it, "
+                    "add facts, explain, or show reasoning. Return strict JSON only: "
+                    '{"queries":["first variant","second variant"]}.'
+                ),
+            },
+            {"role": "user", "content": question},
         ]
 
     @staticmethod

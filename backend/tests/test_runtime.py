@@ -131,6 +131,18 @@ class StorageAndRetrievalTests(unittest.TestCase):
             self.assertEqual(rows[0]["page_chunk_index"], 0)
             self.assertEqual(rows[0]["schema_version"], 3)
 
+    def test_lancedb_search_accepts_cosine_and_l2_distances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = LanceDBStore(Path(temp) / "lance", "chunks")
+            store.replace_chunks(
+                [make_chunk(0, "primero"), make_chunk(1, "segundo")],
+                [[1.0, 0.0], [0.0, 1.0]],
+            )
+            cosine = store.search([1.0, 0.0], 2, distance_type="cosine")
+            l2 = store.search([1.0, 0.0], 2, distance_type="l2")
+            self.assertEqual(cosine[0]["chunk_id"], "chunk-0")
+            self.assertEqual(l2[0]["chunk_id"], "chunk-0")
+
     def test_bm25_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = BM25Store(Path(temp) / "bm25.json")

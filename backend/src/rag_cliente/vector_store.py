@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import lancedb
 import pyarrow as pa
@@ -123,6 +123,7 @@ class LanceDBStore:
         top_k: int,
         tag: str | None = None,
         document_id: str | None = None,
+        distance_type: Literal["l2", "cosine", "dot"] | None = None,
     ) -> list[dict]:
         if self.table_name not in self._table_names():
             raise RuntimeError(
@@ -131,6 +132,8 @@ class LanceDBStore:
         table = self.db.open_table(self.table_name)
         self._validate_schema(table)
         query = table.search(query_vector)
+        if distance_type is not None:
+            query = query.distance_type(distance_type)
         filters: list[str] = []
         if (tag or "").strip():
             filters.append(f"tag = '{_escape_literal(tag.strip())}'")

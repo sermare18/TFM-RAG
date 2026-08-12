@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import gc
 import threading
+import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from rag_cliente.bedrock_parser import BedrockMarkdownParser
 from rag_cliente.bm25_store import BM25Store
@@ -292,31 +293,57 @@ class RagPipeline:
         *,
         top_k: int,
         tag: str | None,
+        retrieval_mode: Literal["vector", "bm25", "hybrid"] | None = None,
+        distance_type: Literal["l2", "cosine", "dot"] | None = None,
+        use_query_instruction: bool | None = None,
+        manage_embeddings: bool = True,
     ) -> list[dict[str, Any]]:
-        mode = self.settings.retrieval_mode
+        mode = retrieval_mode or self.settings.retrieval_mode
         vector_groups: list[list[dict[str, Any]]] = []
         bm25_groups: list[list[dict[str, Any]]] = []
 
         if mode in {"vector", "hybrid"}:
-            with self.coordinator.acquire(
-                "embeddings",
-                workload="query",
-                timeout=self.settings.model_request_timeout,
-            ):
-                self._ensure_models(("embeddings",))
-                try:
+            def vector_search() -> list[list[dict[str, Any]]]:
+                if use_query_instruction is None:
                     query_vectors = self.client.embed_texts(queries, query_mode=True)
-                    vector_groups = [
+                else:
+                    query_vectors = self.client.embed_texts(
+                        queries,
+                        query_mode=True,
+                        use_query_instruction=use_query_instruction,
+                    )
+                return [
+                    (
                         self.store.search(
                             vector,
                             top_k=self.settings.vector_candidates,
                             tag=tag,
                         )
-                        for vector in query_vectors
-                    ]
-                finally:
-                    self._stop_models(("embeddings",))
-                    self._release_model_memory()
+                        if distance_type is None
+                        else self.store.search(
+                            vector,
+                            top_k=self.settings.vector_candidates,
+                            tag=tag,
+                            distance_type=distance_type,
+                        )
+                    )
+                    for vector in query_vectors
+                ]
+
+            if manage_embeddings:
+                with self.coordinator.acquire(
+                    "embeddings",
+                    workload="query",
+                    timeout=self.settings.model_request_timeout,
+                ):
+                    self._ensure_models(("embeddings",))
+                    try:
+                        vector_groups = vector_search()
+                    finally:
+                        self._stop_models(("embeddings",))
+                        self._release_model_memory()
+            else:
+                vector_groups = vector_search()
 
         if mode in {"bm25", "hybrid"}:
             lexical_queries = [
@@ -350,6 +377,127 @@ class RagPipeline:
                 rrf_k=self.settings.rrf_k,
             )
         return self._collapse_to_pages(ranked, top_k)
+
+    def retrieve(
+        self,
+        question: str,
+        *,
+        top_k: int,
+        retrieval_mode: Literal["vector", "bm25", "hybrid"],
+        distance_type: Literal["l2", "cosine"] = "cosine",
+        use_query_instruction: bool = True,
+        query_variants: list[str] | None = None,
+        tag: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recupera paginas para evaluacion sin cargar el modelo de chat."""
+        queries: list[str] = []
+        for candidate in [question, *(query_variants or [])]:
+            normalized = candidate.strip()
+            if normalized and normalized not in queries:
+                queries.append(normalized)
+        if not queries:
+            raise ValueError("La pregunta de evaluacion no puede estar vacia.")
+        return self._retrieve(
+            queries,
+            top_k=top_k,
+            tag=(tag or "").strip() or None,
+            retrieval_mode=retrieval_mode,
+            distance_type=distance_type if retrieval_mode != "bm25" else None,
+            use_query_instruction=(
+                use_query_instruction if retrieval_mode != "bm25" else None
+            ),
+        )
+
+    def retrieve_many(
+        self,
+        questions: list[tuple[str, list[str]]],
+        *,
+        top_k: int,
+        retrieval_mode: Literal["vector", "bm25", "hybrid"],
+        distance_type: Literal["l2", "cosine"] = "cosine",
+        use_query_instruction: bool = True,
+        tag: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[list[list[dict[str, Any]]], list[float]]:
+        """Evalua varias preguntas manteniendo embeddings cargado una sola vez."""
+        if not questions:
+            return [], []
+
+        def run_all(
+            *, manage_embeddings: bool
+        ) -> tuple[list[list[dict[str, Any]]], list[float]]:
+            results: list[list[dict[str, Any]]] = []
+            latencies_ms: list[float] = []
+            total = len(questions)
+            for index, (question, variants) in enumerate(questions, start=1):
+                self._emit(progress_callback, f"Recuperando pregunta {index}/{total}")
+                queries: list[str] = []
+                for candidate in [question, *variants]:
+                    normalized = candidate.strip()
+                    if normalized and normalized not in queries:
+                        queries.append(normalized)
+                if not queries:
+                    raise ValueError("La pregunta de evaluacion no puede estar vacia.")
+                started = time.perf_counter()
+                results.append(
+                    self._retrieve(
+                        queries,
+                        top_k=top_k,
+                        tag=(tag or "").strip() or None,
+                        retrieval_mode=retrieval_mode,
+                        distance_type=(
+                            distance_type if retrieval_mode != "bm25" else None
+                        ),
+                        use_query_instruction=(
+                            use_query_instruction if retrieval_mode != "bm25" else None
+                        ),
+                        manage_embeddings=manage_embeddings,
+                    )
+                )
+                latencies_ms.append((time.perf_counter() - started) * 1000.0)
+            return results, latencies_ms
+
+        if retrieval_mode == "bm25":
+            return run_all(manage_embeddings=False)
+        with self.coordinator.acquire(
+            "embeddings",
+            workload="query",
+            timeout=self.settings.model_request_timeout,
+        ):
+            self._ensure_models(("embeddings",))
+            try:
+                return run_all(manage_embeddings=False)
+            finally:
+                self._stop_models(("embeddings",))
+                self._release_model_memory()
+
+    def generate_query_variants(
+        self,
+        questions: list[str],
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, list[str]]:
+        """Genera variantes en un bloque y libera chat antes de usar embeddings."""
+        if not questions:
+            return {}
+        variants: dict[str, list[str]] = {}
+        with self.coordinator.acquire(
+            "chat",
+            workload="query",
+            timeout=self.settings.model_request_timeout,
+        ):
+            self._ensure_models(("chat",))
+            try:
+                total = len(questions)
+                for index, question in enumerate(questions, start=1):
+                    self._emit(
+                        progress_callback,
+                        f"Reformulando consulta {index}/{total}",
+                    )
+                    variants[question] = self.client.generate_query_variants(question)
+            finally:
+                self._stop_models(("chat",))
+                self._release_model_memory()
+        return variants
 
     @staticmethod
     def _citation_from_match(match: dict[str, Any], source_id: str) -> dict[str, Any]:

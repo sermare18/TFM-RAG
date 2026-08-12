@@ -150,7 +150,40 @@ usar `--refresh-bedrock` ni volver a pagar la conversión de los PDF.
 # API y visor
 .\rag.bat api
 .\rag.bat viewer
+
+# Dataset manual y evaluaciones de retrieval
+.\rag.bat evaluate
 ```
+
+## Evaluador visual de retrieval
+
+`evaluate` abre una interfaz Streamlit con tres pestanas:
+
+1. **Dataset** permite escribir preguntas y marcar los chunks que contienen la
+   informacion correcta. La verdad de referencia se guarda por documento y
+   pagina, de modo que varios chunks de una misma pagina cuentan como el mismo
+   resultado relevante.
+2. **Nueva evaluacion** ejecuta todas las preguntas activas sobre el indice
+   actual. Se pueden cambiar `bm25|vector|hybrid`, Top K, `cosine|l2`, la
+   instruccion de embedding y query augmentation sin reindexar.
+3. **Historial** compara ejecuciones, muestra los fallos y permite descargar el
+   detalle en CSV.
+
+Preguntas, paginas relevantes, configuraciones, rankings y metricas se guardan
+en `data/evaluation.sqlite`. Cada evaluacion conserva el hash de la version del
+dataset que utilizo; la interfaz avisa si se intenta compararla con el dataset
+actual despues de editar o anadir preguntas.
+
+El evaluador mide recuperacion por pagina y no genera una respuesta final. Sus
+metricas son Hit@1, Hit@K, Recall@1, Recall@K, Precision@K, MRR@K, falsos
+positivos, fallos y latencia. Para comparar configuraciones de forma valida se
+deben usar filas con el mismo hash de dataset y el mismo Top K.
+
+Con query augmentation activado, el chat local genera dos reformulaciones a
+temperatura cero. Las variantes se versionan y almacenan en SQLite para
+reutilizarlas. El chat se libera antes de cargar embeddings, y el modelo de
+embeddings permanece cargado durante toda la evaluacion para evitar un arranque
+por pregunta. Esta operacion no llama a Bedrock ni modifica el indice.
 
 Para la primera prueba conviene usar una carpeta que contenga un solo PDF:
 

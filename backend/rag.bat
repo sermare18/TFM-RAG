@@ -20,6 +20,7 @@ if /I "%COMMAND%"=="api" goto :api
 if /I "%COMMAND%"=="index" goto :index
 if /I "%COMMAND%"=="ask" goto :ask
 if /I "%COMMAND%"=="viewer" goto :viewer
+if /I "%COMMAND%"=="evaluate" goto :evaluate
 if /I "%COMMAND%"=="test" goto :test
 if /I "%COMMAND%"=="gpu" goto :gpu
 if /I "%COMMAND%"=="doctor" goto :doctor
@@ -54,6 +55,10 @@ exit /b %ERRORLEVEL%
 
 :viewer
 conda run --no-capture-output -n "%ENV_NAME%" python -m streamlit run streamlit_lancedb_viewer.py
+exit /b %ERRORLEVEL%
+
+:evaluate
+conda run --no-capture-output -n "%ENV_NAME%" python -m streamlit run evaluation_app.py
 exit /b %ERRORLEVEL%
 
 :test
@@ -91,6 +96,7 @@ echo   api [puerto]       Arranca FastAPI. Puerto por defecto: 8000
 echo   index [carpeta]    Indexa documentos; admite --tag despues de la carpeta
 echo   ask [opciones]     Consulta el RAG; admite todas las opciones del CLI
 echo   viewer             Abre el visor de LanceDB
+echo   evaluate           Abre el evaluador visual de retrieval
 echo   test               Ejecuta los tests
 echo   gpu                Muestra la GPU NVIDIA mediante nvidia-smi
 echo   doctor             Valida Bedrock, llama.cpp, disco y modelos sin arrancarlos
