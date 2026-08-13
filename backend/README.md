@@ -144,7 +144,14 @@ usar `--refresh-bedrock` ni volver a pagar la conversión de los PDF.
 # Consulta
 .\rag.bat ask "¿Qué indica el documento?" --top-k 5
 
-# Muestra también la página y el chunk de cada resultado recuperado
+# Query augmentation está activo por defecto. Muestra la pregunta original y
+# las dos reformulaciones utilizadas para recuperar.
+.\rag.bat ask "¿Qué indica el documento?" --show-queries
+
+# Desactiva query augmentation y recupera solo con la pregunta original.
+.\rag.bat ask "¿Qué indica el documento?" --no-query-augmentation
+
+# Muestra páginas, chunks y medidas de ranking de cada resultado recuperado.
 .\rag.bat ask "¿Qué indica el documento?" --stream --show-top-k
 
 # API y visor
@@ -205,7 +212,24 @@ Cambiar `RETRIEVAL_MODE=vector|bm25|hybrid` y `RETRIEVAL_TOP_K` permite comparar
 configuraciones sobre el mismo índice. El resultado recuperado se colapsa por
 página, lo que deja preparado el cálculo posterior de precisión y recall.
 `--show-top-k` muestra esos resultados antes de que el auditor de citas descarte
-los que no soportan directamente la respuesta final.
+los que no soportan directamente la respuesta final. Incluye distancia
+vectorial (menor es mejor), score BM25 (mayor es mejor) y, en modo híbrido,
+score RRF y rangos de cada recuperador cuando estén disponibles.
+
+En `rag.bat ask`, query augmentation está activado por defecto: el chat local
+genera dos reformulaciones y la recuperación combina las tres consultas. El
+chat se libera antes de cargar embeddings. `--no-query-augmentation` conserva
+el comportamiento de una sola consulta y `--show-queries` muestra las consultas
+realmente utilizadas. Si la reformulación falla, `ask` avisa y continúa con la
+pregunta original. El CLI nunca activa ni muestra razonamiento.
+
+Las respuestas están cerradas al contexto documental recuperado: el prompt
+prohíbe usar conocimiento general o ejecutar peticiones ajenas a los documentos.
+Además, el auditor de citas aplica una segunda barrera; si ninguna página
+recuperada respalda directamente la generación, la salida se sustituye por
+`No consta en los documentos recuperados.`. En modo `--stream`, el texto se
+retiene hasta terminar esta comprobación para no mostrar primero una respuesta
+sin respaldo.
 
 ## Verificación
 

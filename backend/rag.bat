@@ -47,7 +47,7 @@ exit /b %ERRORLEVEL%
 
 :ask
 if "%~2"=="" (
-    echo Uso: rag.bat ask "pregunta" [--top-k N] [--tag TAG] [--stream] [--show-reasoning]
+    echo Uso: rag.bat ask "pregunta" [--top-k N] [--tag TAG] [--stream] [--no-query-augmentation] [--show-queries] [--show-top-k]
     exit /b 1
 )
 conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli ask %FORWARD_ARGS%

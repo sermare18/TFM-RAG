@@ -18,6 +18,13 @@ from rag_cliente.resource_coordinator import get_resource_coordinator
 from rag_cliente.vector_store import LanceDBStore
 
 ProgressCallback = Callable[[str], None]
+UNGROUNDED_ANSWER = "No consta en los documentos recuperados."
+
+
+def grounded_answer(answer: str, citations: list[dict[str, Any]]) -> str:
+    """Impide entregar como respuesta una generación sin respaldo documental."""
+    normalized = answer.strip()
+    return normalized if normalized and citations else UNGROUNDED_ANSWER
 
 
 class RagPipeline:
@@ -131,9 +138,10 @@ class RagPipeline:
         question: str,
         rewritten_question: str,
         messages: list[dict[str, str]] | None = None,
+        query_variants: list[str] | None = None,
     ) -> list[str]:
         queries: list[str] = []
-        for candidate in (rewritten_question, question):
+        for candidate in (question, *(query_variants or []), rewritten_question):
             normalized = candidate.strip()
             if normalized and normalized not in queries:
                 queries.append(normalized)
@@ -552,10 +560,25 @@ class RagPipeline:
         top_k: int | None = None,
         messages: list[dict[str, str]] | None = None,
         tag: str | None = None,
+        query_augmentation: bool = False,
     ) -> dict[str, Any]:
         effective_top_k = top_k or self.settings.effective_retrieval_top_k
+        query_variants: list[str] = []
+        augmentation_error: str | None = None
+        if query_augmentation:
+            try:
+                query_variants = self.generate_query_variants([question])[question]
+            except Exception as exc:
+                # Query augmentation improves recall but must not make a normal
+                # question unusable if the local model returns malformed output.
+                augmentation_error = str(exc)
         rewritten = self.client.rewrite_question_for_retrieval(question, messages=messages)
-        queries = self._build_retrieval_queries(question, rewritten, messages=messages)
+        queries = self._build_retrieval_queries(
+            question,
+            rewritten,
+            messages=messages,
+            query_variants=query_variants,
+        )
         matches = self._retrieve(
             queries,
             top_k=effective_top_k,
@@ -578,6 +601,9 @@ class RagPipeline:
             "citations": citations,
             "source_options": source_options,
             "matches": matches,
+            "retrieval_queries": queries,
+            "query_variants": query_variants,
+            "query_augmentation_error": augmentation_error,
         }
 
     def ask(
@@ -587,8 +613,15 @@ class RagPipeline:
         messages: list[dict[str, str]] | None = None,
         tag: str | None = None,
         enable_reasoning: bool = False,
+        query_augmentation: bool = False,
     ) -> dict[str, Any]:
-        inputs = self._prepare_generation_inputs(question, top_k, messages, tag)
+        inputs = self._prepare_generation_inputs(
+            question,
+            top_k,
+            messages,
+            tag,
+            query_augmentation=query_augmentation,
+        )
         with self.coordinator.acquire(
             "chat",
             workload="query",
@@ -609,10 +642,13 @@ class RagPipeline:
                 if self.supervisor is not None:
                     self.supervisor.schedule_idle_stop("chat")
         return {
-            "answer": generation["answer"],
+            "answer": grounded_answer(generation["answer"], citations),
             "reasoning": generation["reasoning"],
             "citations": citations,
             "matches": inputs["matches"],
+            "retrieval_queries": inputs["retrieval_queries"],
+            "query_variants": inputs["query_variants"],
+            "query_augmentation_error": inputs["query_augmentation_error"],
         }
 
     def stream_answer(
@@ -622,8 +658,15 @@ class RagPipeline:
         messages: list[dict[str, str]] | None = None,
         tag: str | None = None,
         enable_reasoning: bool = False,
+        query_augmentation: bool = False,
     ) -> dict[str, Any]:
-        inputs = self._prepare_generation_inputs(question, top_k, messages, tag)
+        inputs = self._prepare_generation_inputs(
+            question,
+            top_k,
+            messages,
+            tag,
+            query_augmentation=query_augmentation,
+        )
         lease = self.coordinator.acquire(
             "chat",
             workload="query",
@@ -687,4 +730,7 @@ class RagPipeline:
             "resolve_citations": resolve_citations,
             "close": cleanup,
             "matches": inputs["matches"],
+            "retrieval_queries": inputs["retrieval_queries"],
+            "query_variants": inputs["query_variants"],
+            "query_augmentation_error": inputs["query_augmentation_error"],
         }

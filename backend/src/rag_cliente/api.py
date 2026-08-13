@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from rag_cliente.config import get_settings
-from rag_cliente.pipeline import RagPipeline
+from rag_cliente.pipeline import RagPipeline, grounded_answer
 from rag_cliente.bedrock_parser import SUPPORTED_DOCUMENT_SUFFIXES
 
 DOCUMENT_SUFFIXES = SUPPORTED_DOCUMENT_SUFFIXES
@@ -408,7 +408,6 @@ def create_app() -> FastAPI:
 
         def event_stream():
             emitted_answer = False
-            emitted_reasoning = False
             collected_answer_parts: list[str] = []
 
             yield serialize_event({"type": "session", "session_id": session_id})
@@ -417,8 +416,7 @@ def create_app() -> FastAPI:
                     emitted_answer = True
                     collected_answer_parts.append(event["delta"])
                 elif event["type"] == "reasoning":
-                    emitted_reasoning = True
-                yield serialize_event(event)
+                    yield serialize_event(event)
 
             if not emitted_answer:
                 yield serialize_event({"type": "fallback", "reason": "reasoning_finished_without_answer"})
@@ -426,20 +424,21 @@ def create_app() -> FastAPI:
                     if event["type"] == "answer":
                         emitted_answer = True
                         collected_answer_parts.append(event["delta"])
-                        yield serialize_event(event)
+
+            answer_text = "".join(collected_answer_parts)
+            citations = result["resolve_citations"](answer_text)
+            final_answer = grounded_answer(answer_text, citations)
 
             app.state.session_store.append_messages(
                 session_id,
                 [
                     *request_messages,
                     {"role": "user", "content": payload.question},
-                    {"role": "assistant", "content": "".join(collected_answer_parts)},
+                    {"role": "assistant", "content": final_answer},
                 ],
             )
 
-            answer_text = "".join(collected_answer_parts)
-            citations = result["resolve_citations"](answer_text)
-
+            yield serialize_event({"type": "answer", "delta": final_answer})
             yield serialize_event({"type": "citations", "citations": citations})
             yield serialize_event({"type": "matches", "matches": result["matches"]})
             yield serialize_event({"type": "done"})

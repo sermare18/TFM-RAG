@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from rag_cliente.api import create_app
 from rag_cliente.config import Settings
 from rag_cliente.llm_client import LlamaCppClient
-from rag_cliente.pipeline import RagPipeline
+from rag_cliente.pipeline import RagPipeline, UNGROUNDED_ANSWER, grounded_answer
 
 
 class FakePipeline:
@@ -136,7 +136,8 @@ class ApiTests(unittest.TestCase):
                 response = client.post("/ask/stream", json={"question": "Nombre?"})
             events = [json.loads(line) for line in response.text.splitlines()]
             self.assertEqual(events[0]["type"], "session")
-            self.assertIn({"type": "answer", "delta": "Ana"}, events)
+            self.assertIn({"type": "answer", "delta": UNGROUNDED_ANSWER}, events)
+            self.assertNotIn({"type": "answer", "delta": "Ana"}, events)
             self.assertEqual(events[-1]["type"], "done")
 
 
@@ -168,6 +169,16 @@ class LocalChatClientTests(unittest.TestCase):
         )
         self.assertIn("[S1] notes.md p.1", messages[-1]["content"])
         self.assertEqual(messages[1]["content"], "Me llamo Ana")
+        self.assertIn("strictly document-grounded", messages[0]["content"])
+        self.assertIn("Never use prior knowledge", messages[0]["content"])
+        self.assertIn("No consta en los documentos recuperados", messages[-1]["content"])
+
+    def test_answer_without_verified_citations_is_rejected(self) -> None:
+        self.assertEqual(grounded_answer("codigo de tres en raya", []), UNGROUNDED_ANSWER)
+        self.assertEqual(
+            grounded_answer("dato respaldado", [{"source_id": "S1"}]),
+            "dato respaldado",
+        )
 
     def test_reasoning_stream_falls_back_to_non_reasoning_answer(self) -> None:
         client = LlamaCppClient(Settings(model_supervision_enabled=False))
@@ -228,6 +239,57 @@ class RetrievalModeTests(unittest.TestCase):
             )
             pipeline.bm25_store.search.assert_not_called()
             pipeline.store.search.assert_called_once_with([0.1, 0.2], top_k=40, tag="guias")
+
+    def test_generation_inputs_add_two_augmented_queries_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            pipeline = self.make_pipeline(Path(temp), "hybrid")
+            pipeline.client = Mock()
+            pipeline.client.rewrite_question_for_retrieval.return_value = "pregunta"
+            pipeline.generate_query_variants = Mock(
+                return_value={"pregunta": ["variante uno", "variante dos"]}
+            )
+            pipeline._retrieve = Mock(return_value=[])
+
+            inputs = pipeline._prepare_generation_inputs(
+                "pregunta",
+                top_k=5,
+                query_augmentation=True,
+            )
+
+            self.assertEqual(
+                inputs["retrieval_queries"],
+                ["pregunta", "variante uno", "variante dos"],
+            )
+            self.assertEqual(inputs["query_variants"], ["variante uno", "variante dos"])
+            self.assertIsNone(inputs["query_augmentation_error"])
+            pipeline._retrieve.assert_called_once_with(
+                ["pregunta", "variante uno", "variante dos"],
+                top_k=5,
+                tag=None,
+            )
+
+    def test_generation_inputs_fall_back_when_augmentation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            pipeline = self.make_pipeline(Path(temp), "hybrid")
+            pipeline.client = Mock()
+            pipeline.client.rewrite_question_for_retrieval.return_value = "pregunta"
+            pipeline.generate_query_variants = Mock(side_effect=RuntimeError("salida invalida"))
+            pipeline._retrieve = Mock(return_value=[])
+
+            inputs = pipeline._prepare_generation_inputs(
+                "pregunta",
+                top_k=5,
+                query_augmentation=True,
+            )
+
+            self.assertEqual(inputs["retrieval_queries"], ["pregunta"])
+            self.assertEqual(inputs["query_variants"], [])
+            self.assertEqual(inputs["query_augmentation_error"], "salida invalida")
+            pipeline._retrieve.assert_called_once_with(
+                ["pregunta"],
+                top_k=5,
+                tag=None,
+            )
 
 
 if __name__ == "__main__":

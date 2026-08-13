@@ -4,17 +4,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from numbers import Real
 from pathlib import Path
 
 from rag_cliente.bedrock_parser import BedrockMarkdownParser
 from rag_cliente.config import get_settings, resolve_local_model_profile
 from rag_cliente.diagnostics import run_doctor
 from rag_cliente.model_manifest import check_models, download_models, plan_models
-from rag_cliente.pipeline import RagPipeline
+from rag_cliente.pipeline import RagPipeline, grounded_answer
+
+
+def _help_formatter(prog: str) -> argparse.HelpFormatter:
+    return argparse.HelpFormatter(prog, max_help_position=32, width=100)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Bedrock + local models RAG")
+    parser = argparse.ArgumentParser(
+        prog="rag.bat",
+        description="Bedrock + local models RAG",
+        formatter_class=_help_formatter,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     index_parser = commands.add_parser("index", help="Index PDF/Markdown files.")
@@ -33,16 +43,31 @@ def build_parser() -> argparse.ArgumentParser:
     preview_parser.add_argument("pdf", type=Path)
     preview_parser.add_argument("pages", type=int, nargs="+")
 
-    ask_parser = commands.add_parser("ask", help="Ask against the current index.")
+    ask_parser = commands.add_parser(
+        "ask",
+        help="Ask against the current index.",
+        formatter_class=_help_formatter,
+    )
     ask_parser.add_argument("question")
     ask_parser.add_argument("--top-k", type=int, default=None)
     ask_parser.add_argument("--tag", default=None)
     ask_parser.add_argument("--stream", action="store_true")
-    ask_parser.add_argument("--show-reasoning", action="store_true")
+    ask_parser.add_argument(
+        "--no-query-augmentation",
+        dest="query_augmentation",
+        action="store_false",
+        help="Retrieve only with the original question.",
+    )
+    ask_parser.add_argument(
+        "--show-queries",
+        action="store_true",
+        help="Show every query used for retrieval.",
+    )
+    ask_parser.set_defaults(query_augmentation=True)
     ask_parser.add_argument(
         "--show-top-k",
         action="store_true",
-        help="Show the ranked chunks retrieved before source attribution.",
+        help="Show ranked pages and available retrieval scores.",
     )
 
     commands.add_parser("doctor", help="Validate configuration without loading models.")
@@ -72,10 +97,44 @@ def _print_sources(citations: list[dict]) -> None:
         )
 
 
+def _print_queries(queries: list[str]) -> None:
+    print("\nRetrieval queries:\n")
+    for index, query in enumerate(queries, start=1):
+        print(f"{index}. {query}")
+
+
+def _score_parts(match: dict) -> list[str]:
+    parts: list[str] = []
+    retrieval_sources = match.get("_retrieval_sources")
+    if isinstance(retrieval_sources, list) and retrieval_sources:
+        parts.append(f"sources={','.join(str(item) for item in retrieval_sources)}")
+
+    rrf_score = match.get("_rrf_score")
+    if isinstance(rrf_score, Real):
+        parts.append(f"rrf_score={float(rrf_score):.6g} (higher is better)")
+
+    vector_rank = match.get("_vector_rank")
+    if isinstance(vector_rank, Real):
+        parts.append(f"vector_rank={int(vector_rank)}")
+    distance = match.get("_distance")
+    if isinstance(distance, Real):
+        parts.append(f"distance={float(distance):.6g} (lower is better)")
+
+    bm25_rank = match.get("_bm25_rank")
+    if isinstance(bm25_rank, Real):
+        parts.append(f"bm25_rank={int(bm25_rank)}")
+    bm25_score = match.get("_bm25_raw_score")
+    if not isinstance(bm25_score, Real):
+        bm25_score = match.get("_bm25_score")
+    if isinstance(bm25_score, Real):
+        parts.append(f"bm25_score={float(bm25_score):.6g} (higher is better)")
+    return parts
+
+
 def _print_top_k(matches: list[dict]) -> None:
-    print("\nTop-k retrieved:\n")
+    print("\nTop-k retrieved pages:\n")
     if not matches:
-        print("[No chunks were retrieved.]")
+        print("[No pages were retrieved.]")
         return
     for rank, match in enumerate(matches, start=1):
         print(
@@ -85,6 +144,21 @@ def _print_top_k(matches: list[dict]) -> None:
             f"chunk {match.get('chunk_index', '?')}, "
             f"path: {match.get('source_path', 'unknown')})"
         )
+        scores = _score_parts(match)
+        if scores:
+            print(f"  {' · '.join(scores)}")
+
+
+def _print_query_diagnostics(result: dict, show_queries: bool) -> None:
+    error = result.get("query_augmentation_error")
+    if error:
+        print(
+            "WARNING: query augmentation failed; retrieval continued with the "
+            f"original question. Detail: {error}",
+            file=sys.stderr,
+        )
+    if show_queries:
+        _print_queries(result.get("retrieval_queries", []))
 
 
 def _print_model_reports(reports: list[dict]) -> None:
@@ -168,30 +242,31 @@ def main() -> None:
             args.question,
             top_k=args.top_k,
             tag=args.tag,
-            enable_reasoning=args.show_reasoning,
+            query_augmentation=args.query_augmentation,
         )
+        _print_query_diagnostics(result, args.show_queries)
         answer_parts: list[str] = []
         for event in result["answer_stream"]:
             if event["type"] == "answer":
                 answer_parts.append(event["delta"])
-                print(event["delta"], end="", flush=True)
-            elif event["type"] == "reasoning" and args.show_reasoning:
-                print(event["delta"], end="", flush=True)
-        print()
-        citations = result["resolve_citations"]("".join(answer_parts))
+        if not answer_parts:
+            for event in result["fallback_stream"]():
+                if event["type"] == "answer":
+                    answer_parts.append(event["delta"])
+        raw_answer = "".join(answer_parts)
+        citations = result["resolve_citations"](raw_answer)
+        print(grounded_answer(raw_answer, citations))
     else:
         result = pipeline.ask(
             args.question,
             top_k=args.top_k,
             tag=args.tag,
-            enable_reasoning=args.show_reasoning,
+            query_augmentation=args.query_augmentation,
         )
-        print("\nAnswer:\n")
-        print(result["answer"] or "[No text returned by the model]")
-        if args.show_reasoning and result["reasoning"]:
-            print("\nReasoning:\n")
-            print(result["reasoning"])
+        _print_query_diagnostics(result, args.show_queries)
         citations = result["citations"]
+        print("\nAnswer:\n")
+        print(grounded_answer(result["answer"], citations))
     _print_sources(citations)
     if args.show_top_k:
         _print_top_k(result.get("matches", []))
