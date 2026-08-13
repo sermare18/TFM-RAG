@@ -14,6 +14,18 @@ from rag_cliente.config import Settings
 
 
 class CliStreamingTests(unittest.TestCase):
+    def test_streamlit_apps_use_different_default_ports(self) -> None:
+        batch = (Path(__file__).resolve().parents[1] / "rag.bat").read_text(
+            encoding="utf-8"
+        )
+        viewer_section = batch.split("\n:viewer\n", 1)[1].split("\n:evaluate\n", 1)[0]
+        evaluator_section = batch.split("\n:evaluate\n", 1)[1].split("\n:test\n", 1)[0]
+
+        self.assertIn('streamlit_lancedb_viewer.py --server.port "%PORT%"', viewer_section)
+        self.assertIn('if "%PORT%"=="" set "PORT=8501"', viewer_section)
+        self.assertIn('evaluation_app.py --server.port "%PORT%"', evaluator_section)
+        self.assertIn('if "%PORT%"=="" set "PORT=8502"', evaluator_section)
+
     def test_stream_resolves_citations_from_complete_answer(self) -> None:
         resolved_answers: list[str] = []
         citation = {

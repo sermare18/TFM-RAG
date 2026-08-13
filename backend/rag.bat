@@ -54,11 +54,17 @@ conda run --no-capture-output -n "%ENV_NAME%" python -m rag_cliente.cli ask %FOR
 exit /b %ERRORLEVEL%
 
 :viewer
-conda run --no-capture-output -n "%ENV_NAME%" python -m streamlit run streamlit_lancedb_viewer.py
+set "PORT=%~2"
+if "%PORT%"=="" set "PORT=8501"
+echo Visor de LanceDB: http://localhost:%PORT%
+conda run --no-capture-output -n "%ENV_NAME%" python -m streamlit run streamlit_lancedb_viewer.py --server.port "%PORT%"
 exit /b %ERRORLEVEL%
 
 :evaluate
-conda run --no-capture-output -n "%ENV_NAME%" python -m streamlit run evaluation_app.py
+set "PORT=%~2"
+if "%PORT%"=="" set "PORT=8502"
+echo Evaluador RAG: http://localhost:%PORT%
+conda run --no-capture-output -n "%ENV_NAME%" python -m streamlit run evaluation_app.py --server.port "%PORT%"
 exit /b %ERRORLEVEL%
 
 :test
@@ -95,8 +101,8 @@ echo.
 echo   api [puerto]       Arranca FastAPI. Puerto por defecto: 8000
 echo   index [carpeta]    Indexa documentos; admite --tag despues de la carpeta
 echo   ask [opciones]     Consulta el RAG; admite todas las opciones del CLI
-echo   viewer             Abre el visor de LanceDB
-echo   evaluate           Abre el evaluador visual de recuperacion
+echo   viewer [puerto]    Abre el visor de LanceDB. Puerto por defecto: 8501
+echo   evaluate [puerto]  Abre el evaluador visual. Puerto por defecto: 8502
 echo   test               Ejecuta los tests
 echo   gpu                Muestra la GPU NVIDIA mediante nvidia-smi
 echo   doctor             Valida Bedrock, llama.cpp, disco y modelos sin arrancarlos

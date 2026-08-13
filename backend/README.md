@@ -154,11 +154,11 @@ usar `--refresh-bedrock` ni volver a pagar la conversión de los PDF.
 # Muestra páginas, chunks y medidas de ranking de cada resultado recuperado.
 .\rag.bat ask "¿Qué indica el documento?" --stream --show-top-k
 
-# API y visor
+# API y visor (visor en http://localhost:8501)
 .\rag.bat api
 .\rag.bat viewer
 
-# Dataset manual y evaluaciones de retrieval
+# Dataset manual y evaluaciones de retrieval (http://localhost:8502)
 .\rag.bat evaluate
 ```
 
