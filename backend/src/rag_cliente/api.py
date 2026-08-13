@@ -37,8 +37,11 @@ class ChatMessage(BaseModel):
 class IndexRequest(BaseModel):
     """Payload para indexar documentos desde un directorio local."""
 
-    doc_dir: str = Field(..., description="Directory containing supported document files.")
-    tag: str | None = Field(default=None, description="Optional metadata tag assigned to indexed chunks.")
+    doc_dir: str = Field(..., description="Directorio que contiene los documentos compatibles.")
+    tag: str | None = Field(
+        default=None,
+        description="Etiqueta de metadatos opcional para los chunks indexados.",
+    )
     refresh_bedrock: bool = Field(default=False)
 
 
@@ -176,9 +179,9 @@ def create_app() -> FastAPI:
     session_store = SessionStore()
 
     app = FastAPI(
-        title="RAG Cliente API",
+        title="API del cliente RAG",
         version="0.1.0",
-        description="HTTP API for indexing local documents and querying the existing RAG pipeline.",
+        description="API HTTP para indexar documentos locales y consultar el RAG existente.",
     )
     app.add_middleware(
         CORSMiddleware,
@@ -215,13 +218,13 @@ def create_app() -> FastAPI:
         if not normalized:
             return None
         if normalized in {".", ".."} or "/" in normalized or "\\" in normalized:
-            raise HTTPException(status_code=400, detail="Invalid tag.")
+            raise HTTPException(status_code=400, detail="La etiqueta no es válida.")
         return normalized
 
     def sanitize_upload_filename(filename: str | None) -> str:
         sanitized_name = Path(filename or "").name
         if not sanitized_name or sanitized_name in {".", ".."}:
-            raise HTTPException(status_code=400, detail="A valid filename is required.")
+            raise HTTPException(status_code=400, detail="Se necesita un nombre de archivo válido.")
         return sanitized_name
 
     def resolve_document_path(relative_file_path: str) -> Path:
@@ -231,12 +234,12 @@ def create_app() -> FastAPI:
             or relative_path.is_absolute()
             or any(part in {"", ".", ".."} for part in relative_path.parts)
         ):
-            raise HTTPException(status_code=400, detail="A valid file path is required.")
+            raise HTTPException(status_code=400, detail="Se necesita una ruta de archivo válida.")
         candidate = (get_documents_dir() / relative_path).resolve()
         try:
             candidate.relative_to(get_documents_dir())
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid file path.") from exc
+            raise HTTPException(status_code=400, detail="La ruta del archivo no es válida.") from exc
         return candidate
 
     def build_upload_destination(filename: str, tag: str | None) -> Path:
@@ -275,9 +278,9 @@ def create_app() -> FastAPI:
     def download_file(file_path: str) -> FileResponse:
         file_path = resolve_document_path(file_path)
         if not file_path.exists() or not file_path.is_file():
-            raise HTTPException(status_code=404, detail="File was not found.")
+            raise HTTPException(status_code=404, detail="No se encontró el archivo.")
         if file_path.suffix.lower() not in DOCUMENT_SUFFIXES:
-            raise HTTPException(status_code=400, detail="File type is not supported.")
+            raise HTTPException(status_code=400, detail="El tipo de archivo no es compatible.")
         return FileResponse(path=file_path, filename=file_path.name)
 
     @app.post("/files/upload", response_model=UploadFileResponse, status_code=201)
@@ -291,14 +294,20 @@ def create_app() -> FastAPI:
         if Path(filename).suffix.lower() not in DOCUMENT_SUFFIXES:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported file type. Allowed extensions: {', '.join(sorted(DOCUMENT_SUFFIXES))}.",
+                detail=(
+                    "Tipo de archivo no compatible. Extensiones permitidas: "
+                    f"{', '.join(sorted(DOCUMENT_SUFFIXES))}."
+                ),
             )
 
         destination = build_upload_destination(filename, normalized_tag)
         if destination.exists() and not overwrite:
             raise HTTPException(
                 status_code=409,
-                detail=f"File '{filename}' already exists. Use overwrite=true to replace it.",
+                detail=(
+                    f"El archivo '{filename}' ya existe. "
+                    "Usa overwrite=true para reemplazarlo."
+                ),
             )
 
         try:
@@ -322,7 +331,10 @@ def create_app() -> FastAPI:
     @app.delete("/sessions/{session_id}", status_code=204)
     def delete_session(session_id: str) -> None:
         if not app.state.session_store.delete_session(session_id):
-            raise HTTPException(status_code=404, detail=f"Session '{session_id}' was not found.")
+            raise HTTPException(
+                status_code=404,
+                detail=f"No se encontró la sesión '{session_id}'.",
+            )
 
     @app.post("/index", response_model=IndexResponse)
     def index_documents(payload: IndexRequest) -> IndexResponse:
@@ -351,7 +363,10 @@ def create_app() -> FastAPI:
         try:
             session_id = app.state.session_store.resolve_session(payload.session_id)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"Session '{payload.session_id}' was not found.") from exc
+            raise HTTPException(
+                status_code=404,
+                detail=f"No se encontró la sesión '{payload.session_id}'.",
+            ) from exc
         request_messages = [message.model_dump() for message in payload.messages]
         history_messages = app.state.session_store.get_messages(session_id)
         combined_messages = [*history_messages, *request_messages]
@@ -385,7 +400,10 @@ def create_app() -> FastAPI:
         try:
             session_id = app.state.session_store.resolve_session(payload.session_id)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"Session '{payload.session_id}' was not found.") from exc
+            raise HTTPException(
+                status_code=404,
+                detail=f"No se encontró la sesión '{payload.session_id}'.",
+            ) from exc
         request_messages = [message.model_dump() for message in payload.messages]
         history_messages = app.state.session_store.get_messages(session_id)
         combined_messages = [*history_messages, *request_messages]
@@ -419,7 +437,12 @@ def create_app() -> FastAPI:
                     yield serialize_event(event)
 
             if not emitted_answer:
-                yield serialize_event({"type": "fallback", "reason": "reasoning_finished_without_answer"})
+                yield serialize_event(
+                    {
+                        "type": "fallback",
+                        "reason": "El razonamiento terminó sin producir una respuesta.",
+                    }
+                )
                 for event in result["fallback_stream"]():
                     if event["type"] == "answer":
                         emitted_answer = True

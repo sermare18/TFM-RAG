@@ -37,13 +37,13 @@ class EvaluationConfig:
 
     def validate(self) -> None:
         if not self.name.strip():
-            raise ValueError("La evaluacion necesita un nombre.")
+            raise ValueError("La evaluación necesita un nombre.")
         if self.retrieval_mode not in {"bm25", "vector", "hybrid"}:
-            raise ValueError("Modo de retrieval no valido.")
+            raise ValueError("El modo de recuperación no es válido.")
         if not 1 <= self.top_k <= 20:
             raise ValueError("Top K debe estar entre 1 y 20.")
         if self.distance_type not in {"l2", "cosine"}:
-            raise ValueError("Distancia vectorial no valida.")
+            raise ValueError("La distancia vectorial no es válida.")
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -297,7 +297,7 @@ class EvaluationRunner:
             aggregate = aggregate_metrics(completed_results, config.top_k)
             self.store.finish_evaluation(evaluation_id, aggregate)
             if progress_callback is not None:
-                progress_callback(len(questions), len(questions), "Evaluacion completada")
+                progress_callback(len(questions), len(questions), "Evaluación completada")
             return self.store.get_evaluation(evaluation_id)
         except BaseException as exc:
             self.store.fail_evaluation(evaluation_id, str(exc))

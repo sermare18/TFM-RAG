@@ -112,7 +112,7 @@ class ResourceCoordinator:
                     remaining = self._remaining(deadline)
                     if remaining == 0:
                         raise TimeoutError(
-                            f"Timeout esperando el recurso FIFO '{resource}'"
+                            f"Tiempo de espera agotado esperando el recurso FIFO '{resource}'"
                         )
                     self._condition.wait(remaining)
 
@@ -139,7 +139,9 @@ class ResourceCoordinator:
                 while not self._can_grant_indexing(waiter):
                     remaining = self._remaining(deadline)
                     if remaining == 0:
-                        raise TimeoutError("Timeout esperando el slot único de indexación")
+                        raise TimeoutError(
+                            "Tiempo de espera agotado esperando el turno único de indexación"
+                        )
                     self._condition.wait(remaining)
 
                 self._index_waiters.popleft()

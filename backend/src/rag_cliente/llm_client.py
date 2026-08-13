@@ -114,7 +114,7 @@ class LlamaCppClient:
         """Genera dos consultas equivalentes para un experimento de retrieval."""
         normalized_question = question.strip()
         if not normalized_question:
-            raise ValueError("La pregunta no puede estar vacia.")
+            raise ValueError("La pregunta no puede estar vacía.")
         response = self.chat_client.chat.completions.create(
             model=self.settings.default_endpoint_model,
             temperature=0.0,
@@ -129,8 +129,8 @@ class LlamaCppClient:
         )
         if len(variants) != 2:
             raise RuntimeError(
-                "El modelo local no devolvio dos reformulaciones validas. "
-                "Revisa el modelo o el prompt de query augmentation."
+                "El modelo local no devolvió dos reformulaciones válidas. "
+                "Revisa el modelo o el prompt de aumento de consultas."
             )
         return variants
 

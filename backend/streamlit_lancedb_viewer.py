@@ -42,15 +42,15 @@ def apply_filters(
 def build_table_rows(rows: list[dict], show_full_text: bool) -> list[dict]:
     return [
         {
-            "source": row.get("source"),
-            "source_type": row.get("source_type"),
-            "tag": row.get("tag"),
-            "page": row.get("page_start"),
-            "page_chunk": row.get("page_chunk_index"),
+            "documento": row.get("source"),
+            "tipo de fuente": row.get("source_type"),
+            "etiqueta": row.get("tag"),
+            "página": row.get("page_start"),
+            "chunk de página": row.get("page_chunk_index"),
             "tokens": row.get("token_count"),
-            "parser_model": row.get("parser_model"),
-            "source_path": row.get("source_path"),
-            "text": row.get("text") if show_full_text else shorten(row.get("text", "")),
+            "modelo de extracción": row.get("parser_model"),
+            "ruta de origen": row.get("source_path"),
+            "texto": row.get("text") if show_full_text else shorten(row.get("text", "")),
         }
         for row in rows
     ]
@@ -59,8 +59,8 @@ def build_table_rows(rows: list[dict], show_full_text: bool) -> list[dict]:
 def main() -> None:
     settings = get_settings()
     db_path = Path(settings.lancedb_uri)
-    st.set_page_config(page_title="LanceDB Viewer", layout="wide")
-    st.title("LanceDB Viewer")
+    st.set_page_config(page_title="Visor de LanceDB", layout="wide")
+    st.title("Visor de LanceDB")
     st.caption(f"Base de datos: {db_path}")
     if not db_path.exists():
         st.error(f"No existe la ruta de LanceDB: {db_path}")
@@ -74,7 +74,7 @@ def main() -> None:
     selected_table = st.sidebar.selectbox("Tabla", tables, index=default)
     show_full = st.sidebar.checkbox("Mostrar texto completo", value=False)
     page_size = st.sidebar.slider("Chunks por pantalla", 10, 200, 25, 5)
-    text_query = st.sidebar.text_input("Buscar en texto / source / path")
+    text_query = st.sidebar.text_input("Buscar en texto, documento o ruta")
 
     rows = LanceDBStore(db_path, selected_table).list_chunks(include_vector=False)
     sources = sorted({row.get("source") for row in rows if row.get("source")})
@@ -82,9 +82,9 @@ def main() -> None:
     tags = sorted({row.get("tag") for row in rows if row.get("tag")})
     filtered = apply_filters(
         rows,
-        st.sidebar.multiselect("Source", sources),
+        st.sidebar.multiselect("Documento", sources),
         st.sidebar.multiselect("Tipo", source_types),
-        st.sidebar.multiselect("Tag", tags),
+        st.sidebar.multiselect("Etiqueta", tags),
         text_query,
     )
 
@@ -101,13 +101,13 @@ def main() -> None:
     if not filtered:
         st.info("No hay chunks para los filtros actuales.")
         return
-    selected = st.selectbox("Source", sorted({row["source"] for row in filtered}))
+    selected = st.selectbox("Documento", sorted({row["source"] for row in filtered}))
     for row in [item for item in filtered if item["source"] == selected]:
         title = f"p.{row['page_start']} · chunk de página {row.get('page_chunk_index', 0)}"
         with st.expander(title):
-            st.write(f"**source_path:** {row['source_path']}")
-            st.write(f"**parser_model:** {row.get('parser_model', '')}")
-            st.write(f"**tag:** {row.get('tag') or ''}")
+            st.write(f"**Ruta de origen:** {row['source_path']}")
+            st.write(f"**Modelo de extracción:** {row.get('parser_model', '')}")
+            st.write(f"**Etiqueta:** {row.get('tag') or ''}")
             st.code(row.get("text", ""), language=None)
 
 

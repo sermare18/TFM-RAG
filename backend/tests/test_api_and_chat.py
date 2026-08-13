@@ -92,6 +92,7 @@ class ApiTests(unittest.TestCase):
                 )
             self.assertEqual(accepted.status_code, 201)
             self.assertEqual(rejected.status_code, 400)
+            self.assertIn("Tipo de archivo no compatible", rejected.json()["detail"])
 
     def test_index_forwards_bedrock_refresh_without_calling_aws(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

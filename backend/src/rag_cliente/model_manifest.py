@@ -121,14 +121,14 @@ def check_artifact(path: Path, kind: str = "model") -> tuple[bool, str]:
     if not path.is_file():
         return False, "no existe"
     if path.stat().st_size < 16:
-        return False, "archivo demasiado pequeno"
+        return False, "archivo demasiado pequeño"
     try:
         with path.open("rb") as handle:
             if handle.read(4) != b"GGUF":
-                return False, "cabecera GGUF invalida"
+                return False, "cabecera GGUF inválida"
     except OSError as exc:
         return False, f"no se pudo leer: {exc}"
-    return True, "GGUF valido"
+    return True, "GGUF válido"
 
 
 def check_role(settings: Settings, role: ModelRoleSpec) -> dict:

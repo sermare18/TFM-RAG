@@ -690,7 +690,7 @@ class BedrockMarkdownParser:
         rendered = self._render_pdf(source)
         if len(rendered) > self.settings.bedrock_max_pages_per_document:
             raise RuntimeError(
-                f"'{source.name}' tiene {len(rendered)} paginas; el limite es "
+                f"'{source.name}' tiene {len(rendered)} páginas; el límite es "
                 f"BEDROCK_MAX_PAGES_PER_DOCUMENT="
                 f"{self.settings.bedrock_max_pages_per_document}"
             )
@@ -710,7 +710,7 @@ class BedrockMarkdownParser:
         total_calls = len(rendered)
         if total_calls > self.settings.bedrock_max_calls_per_document:
             raise RuntimeError(
-                f"'{source.name}' requiere {total_calls} llamadas; el limite es "
+                f"'{source.name}' requiere {total_calls} llamadas; el límite es "
                 f"BEDROCK_MAX_CALLS_PER_DOCUMENT="
                 f"{self.settings.bedrock_max_calls_per_document}"
             )
@@ -821,7 +821,7 @@ class BedrockMarkdownParser:
             raise ValueError("Indica al menos una página para previsualizar")
         if len(requested) > self.settings.bedrock_max_calls_per_document:
             raise RuntimeError(
-                f"La previsualización requiere {len(requested)} llamadas; el limite es "
+                f"La previsualización requiere {len(requested)} llamadas; el límite es "
                 f"BEDROCK_MAX_CALLS_PER_DOCUMENT="
                 f"{self.settings.bedrock_max_calls_per_document}"
             )
@@ -887,7 +887,7 @@ class BedrockMarkdownParser:
         progress_callback: ProgressCallback | None = None,
     ) -> list[MarkdownDocument]:
         if not doc_dir.exists():
-            raise FileNotFoundError(f"Document directory does not exist: {doc_dir}")
+            raise FileNotFoundError(f"El directorio de documentos no existe: {doc_dir}")
         base_dir = doc_dir.resolve()
         paths = [
             path

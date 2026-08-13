@@ -70,15 +70,15 @@ def run_doctor(settings: Settings) -> dict:
         {
             "name": "local_models",
             "ok": all(report["valid"] for report in reports),
-            "detail": f"{sum(report['valid'] for report in reports)}/{len(reports)} roles validos",
+            "detail": f"{sum(report['valid'] for report in reports)}/{len(reports)} roles válidos",
         },
         {
             "name": "bedrock_configuration",
             "ok": bedrock_configured,
             "required": settings.bedrock_enabled,
             "detail": (
-                f"enabled={settings.bedrock_enabled}; region="
-                f"{settings.aws_region or '[sin configurar]'}; model="
+                f"activado={settings.bedrock_enabled}; región="
+                f"{settings.aws_region or '[sin configurar]'}; modelo="
                 f"{settings.bedrock_model_id or '[sin configurar]'}"
             ),
         },

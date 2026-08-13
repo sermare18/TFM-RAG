@@ -146,11 +146,11 @@ class EvaluationStore:
     def _validate_question(question: str, relevant_pages: list[RelevantPage]) -> str:
         normalized = question.strip()
         if not normalized:
-            raise ValueError("La pregunta no puede estar vacia.")
+            raise ValueError("La pregunta no puede estar vacía.")
         if not relevant_pages:
-            raise ValueError("Selecciona al menos una pagina relevante.")
+            raise ValueError("Selecciona al menos una página relevante.")
         if any(not page.document_id.strip() or page.page < 1 for page in relevant_pages):
-            raise ValueError("Las paginas relevantes no son validas.")
+            raise ValueError("Las páginas relevantes no son válidas.")
         return normalized
 
     def save_question(
@@ -376,7 +376,7 @@ class EvaluationStore:
                 (evaluation_id,),
             ).fetchone()
             if row is None:
-                raise KeyError(f"No existe la evaluacion {evaluation_id}.")
+                raise KeyError(f"No existe la evaluación {evaluation_id}.")
             result_rows = connection.execute(
                 "SELECT * FROM evaluation_results WHERE evaluation_id = ? ORDER BY id",
                 (evaluation_id,),

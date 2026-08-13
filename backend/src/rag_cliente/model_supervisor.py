@@ -178,7 +178,7 @@ class ModelSupervisor:
         host, port = _endpoint_host_port(spec.endpoint)
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError(
-                f"Un servidor managed solo puede escuchar en loopback, no en {host}"
+                f"Un servidor gestionado solo puede escuchar en loopback, no en {host}"
             )
 
         command = [
@@ -243,7 +243,7 @@ class ModelSupervisor:
             if remaining:
                 self._sleep(min(0.2, remaining))
         raise TimeoutError(
-            f"Timeout esperando /health de {spec.role} tras "
+            f"Tiempo de espera agotado esperando /health de {spec.role} tras "
             f"{self.settings.model_start_timeout:g}s"
         )
 

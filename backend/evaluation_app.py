@@ -1,4 +1,4 @@
-"""Interfaz Streamlit para construir y evaluar un dataset de retrieval."""
+"""Interfaz Streamlit para construir y evaluar un dataset de recuperación."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def build_components() -> tuple[EvaluationStore, RagPipeline]:
 
 def load_index_rows(pipeline: RagPipeline) -> list[dict[str, Any]]:
     if not pipeline.store.table_exists():
-        raise RuntimeError("No existe el indice. Ejecuta primero '.\\rag.bat index'.")
+        raise RuntimeError("No existe el índice. Ejecuta primero '.\\rag.bat index'.")
     return pipeline.store.list_chunks(include_vector=False)
 
 
@@ -50,7 +50,7 @@ def question_table(questions: list[QuestionRecord]) -> list[dict[str, Any]]:
             "activa": question.active,
             "pregunta": question.question,
             "categoria": question.category,
-            "paginas relevantes": ", ".join(
+            "páginas relevantes": ", ".join(
                 f"{page.source} p.{page.page}" for page in question.relevant_pages
             ),
         }
@@ -66,7 +66,7 @@ def render_dataset(
     active_count = sum(question.active for question in questions)
     st.subheader("Dataset de referencia")
     st.caption(
-        "Las selecciones se muestran por chunk, pero la verdad de referencia se "
+        "Las selecciones se muestran por chunk, pero la referencia correcta se "
         "guarda por documento y página."
     )
     left, right = st.columns(2)
@@ -216,12 +216,12 @@ def render_metrics(metrics: dict[str, Any]) -> None:
         return
     top_k = int(metrics.get("top_k", 0))
     columns = st.columns(6)
-    columns[0].metric("Hit@1", f"{100 * metrics.get('hit_at_1', 0):.1f}%")
-    columns[1].metric(f"Hit@{top_k}", f"{100 * metrics.get('hit_at_k', 0):.1f}%")
+    columns[0].metric("Acierto@1", f"{100 * metrics.get('hit_at_1', 0):.1f}%")
+    columns[1].metric(f"Acierto@{top_k}", f"{100 * metrics.get('hit_at_k', 0):.1f}%")
     columns[2].metric("Recall@1", f"{100 * metrics.get('recall_at_1', 0):.1f}%")
     columns[3].metric(f"Recall@{top_k}", f"{100 * metrics.get('recall_at_k', 0):.1f}%")
     columns[4].metric(f"MRR@{top_k}", f"{metrics.get('mrr_at_k', 0):.3f}")
-    columns[5].metric(f"Precision@{top_k}", f"{metrics.get('precision_at_k', 0):.3f}")
+    columns[5].metric(f"Precisión@{top_k}", f"{metrics.get('precision_at_k', 0):.3f}")
     st.caption(
         f"Falsos positivos: {metrics.get('false_positives', 0)} · "
         f"Fallos: {metrics.get('failures', 0)} · "
@@ -244,7 +244,7 @@ def render_new_evaluation(
     if not questions:
         st.warning("Añade al menos una pregunta activa antes de evaluar.")
         return
-    name = st.text_input("Nombre", placeholder="Híbrido cosine con instrucción")
+    name = st.text_input("Nombre", placeholder="Híbrido con coseno e instrucción")
     col_mode, col_k = st.columns(2)
     mode = col_mode.selectbox(
         "Modo de recuperación",
@@ -268,16 +268,16 @@ def render_new_evaluation(
         use_instruction = False
         st.info("BM25 no utiliza distancia ni instrucción de embedding.")
     use_augmentation = st.checkbox(
-        "Query augmentation: pregunta original + dos reformulaciones",
+        "Aumento de consultas: pregunta original + dos reformulaciones",
         value=False,
     )
     tags = sorted({str(row.get("tag")) for row in rows if row.get("tag")})
-    selected_tag = st.selectbox("Filtro por tag", ["Todos", *tags])
-    tag = None if selected_tag == "Todos" else selected_tag
+    selected_tag = st.selectbox("Filtro por etiqueta", ["Todas", *tags])
+    tag = None if selected_tag == "Todas" else selected_tag
     if tag:
         st.warning(
-            "Se evaluarán todas las preguntas activas, pero retrieval solo buscará "
-            f"dentro del tag '{tag}'."
+            "Se evaluarán todas las preguntas activas, pero la recuperación solo buscará "
+            f"dentro de la etiqueta '{tag}'."
         )
     if use_augmentation:
         st.caption(
@@ -314,6 +314,13 @@ def render_new_evaluation(
 
 def evaluation_table(evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
+    status_labels = {
+        "running": "En curso",
+        "completed": "Completada",
+        "failed": "Fallida",
+    }
+    mode_labels = {"hybrid": "Híbrido", "vector": "Vector", "bm25": "BM25"}
+    distance_labels = {"cosine": "Coseno", "l2": "L2"}
     for evaluation in evaluations:
         config = evaluation["config"]
         metrics = evaluation["metrics"]
@@ -322,15 +329,19 @@ def evaluation_table(evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "id": evaluation["id"],
                 "nombre": evaluation["name"],
-                "estado": evaluation["status"],
+                "estado": status_labels.get(evaluation["status"], evaluation["status"]),
                 "dataset": evaluation["dataset_hash"][:10],
                 "preguntas": evaluation["question_count"],
-                "modo": config.get("retrieval_mode"),
-                "distancia": config.get("distance_type") or "—",
+                "modo": mode_labels.get(
+                    config.get("retrieval_mode"), config.get("retrieval_mode")
+                ),
+                "distancia": distance_labels.get(
+                    config.get("distance_type"), config.get("distance_type") or "—"
+                ),
                 "instrucción": config.get("use_query_instruction", False),
-                "augmentation": config.get("use_query_augmentation", False),
+                "aumento de consultas": config.get("use_query_augmentation", False),
                 "K": top_k,
-                f"Hit@K": metrics.get("hit_at_k"),
+                "Acierto@K": metrics.get("hit_at_k"),
                 f"Recall@K": metrics.get("recall_at_k"),
                 "MRR": metrics.get("mrr_at_k"),
                 "fallos": metrics.get("failures"),
@@ -342,18 +353,18 @@ def evaluation_table(evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def results_csv(evaluation: dict[str, Any]) -> bytes:
     output = io.StringIO()
     fields = [
-        "question_id",
-        "question",
-        "expected_pages",
-        "retrieved_pages",
-        "first_relevant_rank",
-        "recall_at_1",
-        "recall_at_k",
-        "precision_at_k",
-        "mrr_at_k",
-        "false_positives",
-        "failure",
-        "latency_ms",
+        "id_pregunta",
+        "pregunta",
+        "páginas_esperadas",
+        "páginas_recuperadas",
+        "posición_primer_relevante",
+        "recall_1",
+        "recall_k",
+        "precisión_k",
+        "mrr_k",
+        "falsos_positivos",
+        "fallo",
+        "latencia_ms",
         "error",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
@@ -362,22 +373,22 @@ def results_csv(evaluation: dict[str, Any]) -> bytes:
         metrics = result["metrics"]
         writer.writerow(
             {
-                "question_id": result["question_id"],
-                "question": result["question_text"],
-                "expected_pages": "; ".join(
+                "id_pregunta": result["question_id"],
+                "pregunta": result["question_text"],
+                "páginas_esperadas": "; ".join(
                     f"{page['source']} p.{page['page']}" for page in result["expected"]
                 ),
-                "retrieved_pages": "; ".join(
+                "páginas_recuperadas": "; ".join(
                     f"{page['source']} p.{page['page']}" for page in result["retrieved"]
                 ),
-                "first_relevant_rank": metrics.get("first_relevant_rank"),
-                "recall_at_1": metrics.get("recall_at_1"),
-                "recall_at_k": metrics.get("recall_at_k"),
-                "precision_at_k": metrics.get("precision_at_k"),
-                "mrr_at_k": metrics.get("mrr_at_k"),
-                "false_positives": metrics.get("false_positives"),
-                "failure": metrics.get("failure"),
-                "latency_ms": result["latency_ms"],
+                "posición_primer_relevante": metrics.get("first_relevant_rank"),
+                "recall_1": metrics.get("recall_at_1"),
+                "recall_k": metrics.get("recall_at_k"),
+                "precisión_k": metrics.get("precision_at_k"),
+                "mrr_k": metrics.get("mrr_at_k"),
+                "falsos_positivos": metrics.get("false_positives"),
+                "fallo": metrics.get("failure"),
+                "latencia_ms": result["latency_ms"],
                 "error": result.get("error") or "",
             }
         )
@@ -456,11 +467,11 @@ def render_history(store: EvaluationStore) -> None:
         st.write("**Reformulaciones**")
         for variant in result["query_variants"]:
             st.write(f"- {variant}")
-    st.write("**Ranking recuperado**")
+    st.write("**Resultados recuperados**")
     st.dataframe(
         [
             {
-                "rank": item["rank"],
+                "posición": item["rank"],
                 "documento": item["source"],
                 "página": item["page"],
                 "distancia": item["distance"],

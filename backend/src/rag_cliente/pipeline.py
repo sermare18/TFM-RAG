@@ -1,4 +1,4 @@
-"""Orchestration for Bedrock ingestion and local RAG retrieval/generation."""
+"""Orquestación de la ingesta con Bedrock y del RAG local."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def grounded_answer(answer: str, citations: list[dict[str, Any]]) -> str:
 
 
 class RagPipeline:
-    """Small facade for indexing, retrieval and answer generation."""
+    """Fachada para indexación, recuperación y generación de respuestas."""
 
     def __init__(
         self,
@@ -80,7 +80,7 @@ class RagPipeline:
         *,
         refresh_bedrock: bool = False,
     ) -> int:
-        """Index PDF/Markdown documents, reusing the paid Markdown cache."""
+        """Indexa documentos PDF/Markdown reutilizando la caché de pago."""
         self._emit(progress_callback, f"Iniciando indexado en: {doc_dir}")
         with self.coordinator.acquire_indexing(timeout=self.settings.index_job_timeout):
             documents = self.document_parser.load_directory(
@@ -91,11 +91,11 @@ class RagPipeline:
             page_count = sum(len(document.pages) for document in documents)
             self._emit(
                 progress_callback,
-                f"Documentos: {len(documents)}; paginas Markdown: {page_count}",
+                f"Documentos: {len(documents)}; páginas Markdown: {page_count}",
             )
 
             chunks = self.chunker.chunk_documents(documents, tag=tag)
-            self._emit(progress_callback, f"Chunks por pagina: {len(chunks)}")
+            self._emit(progress_callback, f"Chunks por página: {len(chunks)}")
             if not chunks:
                 self._emit(progress_callback, "No hay contenido que indexar.")
                 return 0
@@ -397,14 +397,14 @@ class RagPipeline:
         query_variants: list[str] | None = None,
         tag: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Recupera paginas para evaluacion sin cargar el modelo de chat."""
+        """Recupera páginas para evaluación sin cargar el modelo de chat."""
         queries: list[str] = []
         for candidate in [question, *(query_variants or [])]:
             normalized = candidate.strip()
             if normalized and normalized not in queries:
                 queries.append(normalized)
         if not queries:
-            raise ValueError("La pregunta de evaluacion no puede estar vacia.")
+            raise ValueError("La pregunta de evaluación no puede estar vacía.")
         return self._retrieve(
             queries,
             top_k=top_k,
@@ -445,7 +445,7 @@ class RagPipeline:
                     if normalized and normalized not in queries:
                         queries.append(normalized)
                 if not queries:
-                    raise ValueError("La pregunta de evaluacion no puede estar vacia.")
+                    raise ValueError("La pregunta de evaluación no puede estar vacía.")
                 started = time.perf_counter()
                 results.append(
                     self._retrieve(

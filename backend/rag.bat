@@ -96,7 +96,7 @@ echo   api [puerto]       Arranca FastAPI. Puerto por defecto: 8000
 echo   index [carpeta]    Indexa documentos; admite --tag despues de la carpeta
 echo   ask [opciones]     Consulta el RAG; admite todas las opciones del CLI
 echo   viewer             Abre el visor de LanceDB
-echo   evaluate           Abre el evaluador visual de retrieval
+echo   evaluate           Abre el evaluador visual de recuperacion
 echo   test               Ejecuta los tests
 echo   gpu                Muestra la GPU NVIDIA mediante nvidia-smi
 echo   doctor             Valida Bedrock, llama.cpp, disco y modelos sin arrancarlos

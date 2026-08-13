@@ -5,11 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, call
 
+from evaluation_app import evaluation_table, results_csv
 from rag_cliente.config import Settings
 from rag_cliente.evaluation_store import EvaluationStore, RelevantPage
 from rag_cliente.evaluator import EvaluationConfig, EvaluationRunner, score_retrieval
 from rag_cliente.llm_client import LlamaCppClient
 from rag_cliente.pipeline import RagPipeline
+from streamlit_lancedb_viewer import build_table_rows
 
 
 def relevant(document_id: str = "doc-1", page: int = 2) -> RelevantPage:
@@ -75,6 +77,62 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(metrics["mrr_at_k"], 1.0)
         self.assertEqual(metrics["false_positives"], 1)
         self.assertFalse(metrics["failure"])
+
+
+class SpanishPresentationTests(unittest.TestCase):
+    def test_evaluation_history_and_csv_use_spanish_labels(self) -> None:
+        evaluation = {
+            "id": 1,
+            "name": "prueba",
+            "status": "completed",
+            "dataset_hash": "1234567890abcdef",
+            "question_count": 1,
+            "config": {
+                "retrieval_mode": "hybrid",
+                "distance_type": "cosine",
+                "use_query_instruction": True,
+                "use_query_augmentation": True,
+                "top_k": 5,
+            },
+            "metrics": {"hit_at_k": 1.0, "recall_at_k": 1.0, "mrr_at_k": 1.0},
+            "results": [
+                {
+                    "question_id": 1,
+                    "question_text": "pregunta",
+                    "expected": [{"source": "doc.pdf", "page": 2}],
+                    "retrieved": [{"source": "doc.pdf", "page": 2}],
+                    "metrics": {},
+                    "latency_ms": 10.0,
+                }
+            ],
+        }
+
+        row = evaluation_table([evaluation])[0]
+        self.assertEqual(row["estado"], "Completada")
+        self.assertEqual(row["modo"], "Híbrido")
+        self.assertEqual(row["distancia"], "Coseno")
+        csv_text = results_csv(evaluation).decode("utf-8-sig")
+        self.assertIn("páginas_esperadas", csv_text.splitlines()[0])
+        self.assertIn("posición_primer_relevante", csv_text.splitlines()[0])
+
+    def test_viewer_table_uses_spanish_column_names(self) -> None:
+        row = build_table_rows(
+            [
+                {
+                    "source": "doc.pdf",
+                    "source_type": "pdf",
+                    "page_start": 2,
+                    "page_chunk_index": 0,
+                    "text": "contenido",
+                }
+            ],
+            show_full_text=True,
+        )[0]
+
+        self.assertIn("documento", row)
+        self.assertIn("página", row)
+        self.assertIn("ruta de origen", row)
+        self.assertIn("texto", row)
 
 
 class FakeRetriever:

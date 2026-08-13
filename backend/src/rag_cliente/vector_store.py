@@ -127,7 +127,8 @@ class LanceDBStore:
     ) -> list[dict]:
         if self.table_name not in self._table_names():
             raise RuntimeError(
-                f"LanceDB table '{self.table_name}' does not exist yet. Run the index command first."
+                f"La tabla de LanceDB '{self.table_name}' todavía no existe. "
+                "Ejecuta primero el comando de indexación."
             )
         table = self.db.open_table(self.table_name)
         self._validate_schema(table)
@@ -157,7 +158,8 @@ class LanceDBStore:
     def list_chunks(self, include_vector: bool = False) -> list[dict]:
         if not self.table_exists():
             raise RuntimeError(
-                f"LanceDB table '{self.table_name}' does not exist yet. Run the index command first."
+                f"La tabla de LanceDB '{self.table_name}' todavía no existe. "
+                "Ejecuta primero el comando de indexación."
             )
         table = self.db.open_table(self.table_name)
         self._validate_schema(table)
