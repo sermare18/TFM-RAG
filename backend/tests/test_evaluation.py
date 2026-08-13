@@ -62,6 +62,52 @@ class EvaluationStoreTests(unittest.TestCase):
             )
             self.assertIsNone(store.get_query_variants("pregunta", "v2"))
 
+    def test_delete_evaluation_cascades_results_and_keeps_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = EvaluationStore(Path(temp) / "evaluation.sqlite")
+            question_id = store.save_question("Pregunta", [relevant()])
+            questions, dataset_hash = store.active_dataset()
+            evaluation_id = store.start_evaluation(
+                "Evaluación descartable",
+                {"retrieval_mode": "hybrid", "top_k": 1},
+                dataset_hash,
+                len(questions),
+            )
+            store.add_evaluation_result(
+                evaluation_id,
+                question_id=question_id,
+                question_text="Pregunta",
+                expected=[{"document_id": "doc-1", "page": 2}],
+                retrieved=[],
+                query_variants=[],
+                metrics={"failure": True},
+                latency_ms=1.0,
+            )
+
+            self.assertTrue(store.delete_evaluation(evaluation_id))
+            self.assertFalse(store.delete_evaluation(evaluation_id))
+            self.assertEqual(store.list_evaluations(), [])
+            with self.assertRaises(KeyError):
+                store.get_evaluation(evaluation_id)
+            with store._connection() as connection:
+                result_count = connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_results"
+                ).fetchone()[0]
+            self.assertEqual(result_count, 0)
+            self.assertEqual(store.get_question(question_id).question, "Pregunta")
+
+    def test_evaluation_names_must_be_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = EvaluationStore(Path(temp) / "evaluation.sqlite")
+            first_id = store.start_evaluation("Comparativa", {}, "dataset", 1)
+
+            with self.assertRaisesRegex(ValueError, "Ya existe una evaluación"):
+                store.start_evaluation("  comparativa  ", {}, "dataset", 1)
+
+            evaluations = store.list_evaluations()
+            self.assertEqual([item["id"] for item in evaluations], [first_id])
+            self.assertEqual(evaluations[0]["name"], "Comparativa")
+
 
 class MetricTests(unittest.TestCase):
     def test_page_metrics_support_multiple_relevant_pages(self) -> None:
@@ -194,7 +240,14 @@ class EvaluationRunnerTests(unittest.TestCase):
                 use_query_augmentation=True,
             )
             runner.run(config)
-            runner.run(config)
+            runner.run(
+                EvaluationConfig(
+                    name="augmentation 2",
+                    retrieval_mode="bm25",
+                    top_k=2,
+                    use_query_augmentation=True,
+                )
+            )
             self.assertEqual(retriever.augmentation_calls, 1)
             self.assertEqual(
                 retriever.retrieval_calls[-1]["query_variants"],

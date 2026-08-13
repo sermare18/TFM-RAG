@@ -244,7 +244,21 @@ def render_new_evaluation(
     if not questions:
         st.warning("Añade al menos una pregunta activa antes de evaluar.")
         return
-    name = st.text_input("Nombre", placeholder="Híbrido con coseno e instrucción")
+    name = st.text_input(
+        "Nombre",
+        placeholder="Híbrido con coseno e instrucción",
+        help="Cada evaluación debe tener un nombre único.",
+    )
+    normalized_name = name.strip().casefold()
+    duplicate_name = bool(
+        normalized_name
+        and any(
+            evaluation["name"].strip().casefold() == normalized_name
+            for evaluation in store.list_evaluations()
+        )
+    )
+    if duplicate_name:
+        st.error("Ya existe una evaluación con ese nombre. Utiliza uno diferente.")
     col_mode, col_k = st.columns(2)
     mode = col_mode.selectbox(
         "Modo de recuperación",
@@ -285,7 +299,7 @@ def render_new_evaluation(
             "Después se libera chat antes de cargar embeddings."
         )
 
-    if st.button("Evaluar", type="primary"):
+    if st.button("Evaluar", type="primary", disabled=duplicate_name):
         config = EvaluationConfig(
             name=name,
             retrieval_mode=mode,  # type: ignore[arg-type]
@@ -414,6 +428,28 @@ def render_history(store: EvaluationStore) -> None:
             if evaluation["id"] == item
         ),
     )
+    with st.expander("Eliminar evaluación"):
+        st.warning(
+            "Esta acción elimina la evaluación y todos sus resultados. "
+            "No afecta al dataset, los documentos ni el índice RAG."
+        )
+        confirmed = st.checkbox(
+            "Confirmo que quiero eliminar esta evaluación",
+            key=f"confirm-delete-evaluation-{selected_id}",
+        )
+        if st.button(
+            "Eliminar evaluación definitivamente",
+            disabled=not confirmed,
+            key=f"delete-evaluation-{selected_id}",
+        ):
+            if store.delete_evaluation(selected_id):
+                if st.session_state.get("last_evaluation_id") == selected_id:
+                    st.session_state.pop("last_evaluation_id", None)
+                st.success(f"Evaluación #{selected_id} eliminada.")
+                st.rerun()
+            else:
+                st.error(f"La evaluación #{selected_id} ya no existe.")
+
     evaluation = store.get_evaluation(selected_id)
     render_metrics(evaluation["metrics"])
     _questions, current_hash = store.active_dataset()

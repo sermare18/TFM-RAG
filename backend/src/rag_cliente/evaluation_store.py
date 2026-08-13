@@ -280,15 +280,34 @@ class EvaluationStore:
         dataset_hash: str,
         question_count: int,
     ) -> int:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("La evaluación necesita un nombre.")
         with self._connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO evaluations(
                     name, status, created_at, dataset_hash, question_count, config_json
-                ) VALUES (?, 'running', ?, ?, ?, ?)
+                )
+                SELECT ?, 'running', ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM evaluations WHERE name = ? COLLATE NOCASE
+                )
                 """,
-                (name.strip(), _utc_now(), dataset_hash, question_count, _json_dump(config)),
+                (
+                    normalized_name,
+                    _utc_now(),
+                    dataset_hash,
+                    question_count,
+                    _json_dump(config),
+                    normalized_name,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"Ya existe una evaluación llamada '{normalized_name}'. "
+                    "Utiliza un nombre diferente."
+                )
             return int(cursor.lastrowid)
 
     def add_evaluation_result(
@@ -368,6 +387,15 @@ class EvaluationStore:
                 "SELECT * FROM evaluations ORDER BY id DESC"
             ).fetchall()
         return [self._decode_evaluation(row) for row in rows]
+
+    def delete_evaluation(self, evaluation_id: int) -> bool:
+        """Elimina una evaluación y sus resultados asociados en cascada."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM evaluations WHERE id = ?",
+                (evaluation_id,),
+            )
+            return cursor.rowcount == 1
 
     def get_evaluation(self, evaluation_id: int) -> dict[str, Any]:
         with self._connection() as connection:
