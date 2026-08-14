@@ -167,8 +167,7 @@ def render_dataset(
                 ):
                     st.code(str(row.get("text", "")), language=None)
 
-    save_col, delete_col = st.columns([3, 1])
-    if save_col.button(
+    if st.button(
         "Guardar pregunta" if editing is None else "Guardar cambios",
         type="primary",
         key=f"save-{form_key}",
@@ -204,11 +203,23 @@ def render_dataset(
             st.rerun()
 
     if editing is not None:
-        confirm_delete = delete_col.checkbox("Confirmar borrado", key=f"confirm-{form_key}")
-        if delete_col.button("Eliminar", disabled=not confirm_delete, key=f"delete-{form_key}"):
-            store.delete_question(editing.id)
-            st.success("Pregunta eliminada. Los resultados históricos se conservan.")
-            st.rerun()
+        with st.expander("Eliminar pregunta"):
+            st.warning(
+                "Esta acción elimina la pregunta del dataset. Los resultados "
+                "históricos se conservarán y el índice RAG no se modificará."
+            )
+            confirm_delete = st.checkbox(
+                "Confirmo que quiero eliminar esta pregunta",
+                key=f"confirm-{form_key}",
+            )
+            if st.button(
+                "Eliminar pregunta definitivamente",
+                disabled=not confirm_delete,
+                key=f"delete-{form_key}",
+            ):
+                store.delete_question(editing.id)
+                st.success("Pregunta eliminada. Los resultados históricos se conservan.")
+                st.rerun()
 
 
 def render_metrics(metrics: dict[str, Any]) -> None:
@@ -267,13 +278,12 @@ def render_new_evaluation(
     )
     top_k = int(col_k.number_input("Top K", min_value=1, max_value=20, value=5, step=1))
     if mode != "bm25":
-        col_distance, col_instruction = st.columns(2)
-        distance = col_distance.selectbox(
+        distance = st.selectbox(
             "Distancia vectorial",
             ["cosine", "l2"],
             format_func=lambda value: "Coseno" if value == "cosine" else "L2",
         )
-        use_instruction = col_instruction.checkbox(
+        use_instruction = st.checkbox(
             "Usar instrucción de embedding",
             value=True,
         )
@@ -416,6 +426,29 @@ def render_history(store: EvaluationStore) -> None:
         st.info("Todavía no hay evaluaciones.")
         return
     st.dataframe(evaluation_table(evaluations), width="stretch", hide_index=True)
+    with st.expander("Eliminar todas las evaluaciones"):
+        st.warning(
+            "Esta acción elimina todo el historial de evaluaciones y sus resultados. "
+            "No afecta al dataset, las reformulaciones guardadas, los documentos ni el índice RAG."
+        )
+        confirm_delete_all = st.checkbox(
+            "Confirmo que quiero eliminar todas las evaluaciones",
+            key="confirm-delete-all-evaluations",
+        )
+        if st.button(
+            "Eliminar todo el historial definitivamente",
+            type="primary",
+            disabled=not confirm_delete_all,
+            key="delete-all-evaluations",
+        ):
+            deleted_count = sum(
+                store.delete_evaluation(evaluation["id"])
+                for evaluation in evaluations
+            )
+            st.session_state.pop("last_evaluation_id", None)
+            st.success(f"Se han eliminado {deleted_count} evaluaciones.")
+            st.rerun()
+
     default_id = st.session_state.get("last_evaluation_id", evaluations[0]["id"])
     ids = [evaluation["id"] for evaluation in evaluations]
     selected_id = st.selectbox(

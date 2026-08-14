@@ -96,6 +96,37 @@ class EvaluationStoreTests(unittest.TestCase):
             self.assertEqual(result_count, 0)
             self.assertEqual(store.get_question(question_id).question, "Pregunta")
 
+    def test_delete_all_evaluations_cascades_results_and_keeps_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = EvaluationStore(Path(temp) / "evaluation.sqlite")
+            question_id = store.save_question("Pregunta", [relevant()])
+            _questions, dataset_hash = store.active_dataset()
+            first_id = store.start_evaluation("Primera", {}, dataset_hash, 1)
+            store.start_evaluation("Segunda", {}, dataset_hash, 1)
+            store.add_evaluation_result(
+                first_id,
+                question_id=question_id,
+                question_text="Pregunta",
+                expected=[{"document_id": "doc-1", "page": 2}],
+                retrieved=[],
+                query_variants=[],
+                metrics={"failure": True},
+                latency_ms=1.0,
+            )
+
+            deleted_count = sum(
+                store.delete_evaluation(evaluation["id"])
+                for evaluation in store.list_evaluations()
+            )
+            self.assertEqual(deleted_count, 2)
+            self.assertEqual(store.list_evaluations(), [])
+            with store._connection() as connection:
+                result_count = connection.execute(
+                    "SELECT COUNT(*) FROM evaluation_results"
+                ).fetchone()[0]
+            self.assertEqual(result_count, 0)
+            self.assertEqual(store.get_question(question_id).question, "Pregunta")
+
     def test_evaluation_names_must_be_unique(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = EvaluationStore(Path(temp) / "evaluation.sqlite")

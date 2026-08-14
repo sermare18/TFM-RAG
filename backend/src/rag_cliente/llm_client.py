@@ -11,7 +11,7 @@ from openai import OpenAI
 
 ProgressCallback = Callable[[str], None]
 
-QUERY_AUGMENTATION_PROMPT_VERSION = "query-augmentation-v1"
+QUERY_AUGMENTATION_PROMPT_VERSION = "query-augmentation-v2"
 
 from rag_cliente.config import Settings
 from rag_cliente.local_endpoints import is_local_model_endpoint
@@ -509,10 +509,22 @@ class LlamaCppClient:
             {
                 "role": "system",
                 "content": (
-                    "You generate search-query variants for a RAG retriever. "
-                    "Return exactly two concise reformulations that preserve the "
-                    "meaning and language of the original question. Do not answer it, "
-                    "add facts, explain, or show reasoning. Return strict JSON only: "
+                    "You generate complementary search queries for a RAG retriever over "
+                    "a closed corpus of PDF documents. Return exactly two concise queries "
+                    "with different retrieval roles, not superficial paraphrases. "
+                    "The first query is a lexical keyword expansion, not a full-sentence "
+                    "reformulation: preserve verbatim every proper name, acronym, identifier, "
+                    "command-line flag, number, and technical expression, then append useful "
+                    "synonyms, abbreviations, or document labels already implied by the question. "
+                    "It must contain at least one retrieval term absent from the original; never "
+                    "return the original question unchanged. "
+                    "The second query is semantic: express the information need in document-style "
+                    "technical language and include the kind of evidence sought, such as a "
+                    "definition, formula, table, requirement, comparison, or procedure. "
+                    "Both queries must preserve the original intent and language, cover every "
+                    "subquestion, and differ from the original and from each other. Do not answer "
+                    "the question, invent values or facts, explain, or show reasoning. "
+                    "Return strict JSON only: "
                     '{"queries":["first variant","second variant"]}.'
                 ),
             },

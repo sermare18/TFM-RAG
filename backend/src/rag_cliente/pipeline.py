@@ -238,38 +238,40 @@ class RagPipeline:
     ) -> list[dict[str, Any]]:
         merged: dict[tuple[Any, ...], dict[str, Any]] = {}
 
-        def best_ranks(groups: list[list[dict[str, Any]]]):
-            best: dict[tuple[Any, ...], tuple[int, dict[str, Any]]] = {}
-            for matches in groups:
-                for rank, match in enumerate(matches, start=1):
-                    key = cls._match_key(match)
-                    if key not in best or rank < best[key][0]:
-                        best[key] = (rank, match)
-            return best
-
         for source, groups in (
             ("vector", vector_match_groups),
             ("bm25", bm25_match_groups),
         ):
-            for key, (rank, match) in best_ranks(groups).items():
-                item = merged.setdefault(key, dict(match))
-                item.setdefault("_retrieval_sources", [])
-                for field, value in match.items():
-                    item.setdefault(field, value)
-                item[f"_{source}_rank"] = rank
-                if source == "vector":
-                    item["_vector_score"] = cls._vector_score(match)
-                else:
-                    item["_bm25_raw_score"] = float(match.get("_bm25_score", 0.0))
-                if source not in item["_retrieval_sources"]:
-                    item["_retrieval_sources"].append(source)
+            for matches in groups:
+                seen_in_ranking: set[tuple[Any, ...]] = set()
+                for rank, match in enumerate(matches, start=1):
+                    key = cls._match_key(match)
+                    if key in seen_in_ranking:
+                        continue
+                    seen_in_ranking.add(key)
 
-        for item in merged.values():
-            item["_rrf_score"] = sum(
-                1.0 / (rrf_k + int(item[field]))
-                for field in ("_vector_rank", "_bm25_rank")
-                if field in item
-            )
+                    item = merged.setdefault(key, dict(match))
+                    item.setdefault("_retrieval_sources", [])
+                    item["_rrf_score"] = float(item.get("_rrf_score", 0.0)) + (
+                        1.0 / (rrf_k + rank)
+                    )
+                    rank_field = f"_{source}_rank"
+                    previous_rank = item.get(rank_field)
+                    if not isinstance(previous_rank, int) or rank < previous_rank:
+                        item[rank_field] = rank
+                    if source == "vector":
+                        vector_score = cls._vector_score(match)
+                        if vector_score > float(item.get("_vector_score", 0.0)):
+                            item["_vector_score"] = vector_score
+                            item["_distance"] = match.get("_distance")
+                    else:
+                        bm25_score = float(match.get("_bm25_score", 0.0))
+                        if bm25_score > float(item.get("_bm25_raw_score", 0.0)):
+                            item["_bm25_raw_score"] = bm25_score
+                            item["_bm25_score"] = bm25_score
+                    if source not in item["_retrieval_sources"]:
+                        item["_retrieval_sources"].append(source)
+
         return sorted(
             merged.values(),
             key=lambda item: (
@@ -372,7 +374,9 @@ class RagPipeline:
             self.settings.bm25_candidates,
         )
         if mode == "vector":
-            ranked = self._merge_matches(vector_groups, candidate_limit)
+            ranked = self._merge_hybrid_matches(
+                vector_groups, [], candidate_limit, rrf_k=self.settings.rrf_k
+            )
         elif mode == "bm25":
             ranked = self._merge_hybrid_matches(
                 [], bm25_groups, candidate_limit, rrf_k=self.settings.rrf_k

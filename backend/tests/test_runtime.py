@@ -9,6 +9,10 @@ from rag_cliente.bedrock_parser import MarkdownDocument, MarkdownPage
 from rag_cliente.bm25_store import BM25Store
 from rag_cliente.config import Settings
 from rag_cliente.indexer import ChunkRecord
+from rag_cliente.llm_client import (
+    QUERY_AUGMENTATION_PROMPT_VERSION,
+    LlamaCppClient,
+)
 from rag_cliente.model_manifest import check_models, get_role, roles_for_profile
 from rag_cliente.model_supervisor import ModelServerSpec, ModelSupervisor, build_server_specs
 from rag_cliente.pipeline import RagPipeline
@@ -188,6 +192,34 @@ class StorageAndRetrievalTests(unittest.TestCase):
         pages = RagPipeline._collapse_to_pages(ranked, 2)
         self.assertEqual(len(pages), 2)
         self.assertEqual(len({(item["document_id"], item["page_start"]) for item in pages}), 2)
+
+    def test_rrf_accumulates_each_query_ranking(self) -> None:
+        vector = [
+            [
+                {**asdict(make_chunk(0, "a")), "_distance": 0.1},
+                {**asdict(make_chunk(1, "b")), "_distance": 0.2},
+            ],
+            [
+                {**asdict(make_chunk(1, "b")), "_distance": 0.1},
+                {**asdict(make_chunk(2, "c")), "_distance": 0.2},
+            ],
+        ]
+
+        ranked = RagPipeline._merge_hybrid_matches(vector, [], 10, rrf_k=60)
+
+        self.assertEqual(ranked[0]["chunk_id"], "chunk-1")
+        self.assertAlmostEqual(ranked[0]["_rrf_score"], 1 / 62 + 1 / 61)
+
+    def test_query_augmentation_v2_assigns_distinct_retrieval_roles(self) -> None:
+        messages = LlamaCppClient._build_query_augmentation_messages("pregunta")
+        instruction = messages[0]["content"]
+
+        self.assertEqual(QUERY_AUGMENTATION_PROMPT_VERSION, "query-augmentation-v2")
+        self.assertIn("first query is a lexical keyword expansion", instruction)
+        self.assertIn("second query is semantic", instruction)
+        self.assertIn("not superficial paraphrases", instruction)
+        self.assertIn("never return the original question unchanged", instruction)
+        self.assertEqual(messages[1], {"role": "user", "content": "pregunta"})
 
 
 class FakeDocumentParser:
