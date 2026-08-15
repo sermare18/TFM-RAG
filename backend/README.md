@@ -142,7 +142,10 @@ usar `--refresh-bedrock` ni volver a pagar la conversión de los PDF.
 .\rag.bat bedrock-preview data\pdfs\guias\guia.pdf 31
 
 # Consulta
-.\rag.bat ask "¿Qué indica el documento?" --top-k 5
+.\rag.bat ask "¿Qué indica el documento?"
+
+# Sobrescribe la configuración de recuperación predeterminada del comando ask.
+.\rag.bat ask "¿Qué indica el documento?" --top-k 4 --retrieval-mode hybrid
 
 # Query augmentation está activo por defecto. Muestra la pregunta original y
 # las dos reformulaciones utilizadas para recuperar.
@@ -208,20 +211,23 @@ llamadas necesarias y guarda el Markdown por página en `data/markdown`.
 Los errores temporales `503`, `500` y `ModelNotReady` se reintentan con espera
 exponencial y jitter antes de interrumpir el indexado.
 
-Cambiar `RETRIEVAL_MODE=vector|bm25|hybrid` y `RETRIEVAL_TOP_K` permite comparar
-configuraciones sobre el mismo índice. El resultado recuperado se colapsa por
+Cambiar `RETRIEVAL_MODE=vector|bm25|hybrid` y `RETRIEVAL_TOP_K` permite cambiar
+la configuración global. El resultado recuperado se colapsa por
 página, lo que deja preparado el cálculo posterior de precisión y recall.
 `--show-top-k` muestra esos resultados antes de que el auditor de citas descarte
 los que no soportan directamente la respuesta final. Incluye distancia
 vectorial (menor es mejor), score BM25 (mayor es mejor) y, en modo híbrido,
 score RRF y rangos de cada recuperador cuando estén disponibles.
 
-En `rag.bat ask`, query augmentation está activado por defecto: el chat local
-genera dos reformulaciones y la recuperación combina las tres consultas. El
-chat se libera antes de cargar embeddings. `--no-query-augmentation` conserva
-el comportamiento de una sola consulta y `--show-queries` muestra las consultas
-realmente utilizadas. Si la reformulación falla, `ask` avisa y continúa con la
-pregunta original. El CLI nunca activa ni muestra razonamiento.
+`rag.bat ask` usa por defecto recuperación vectorial, distancia coseno, Top K 9,
+instrucción de consulta y query augmentation. El chat local genera dos
+reformulaciones y la recuperación combina las tres consultas. El chat se libera
+antes de cargar embeddings. `--top-k`, `--retrieval-mode` y `--distance-type`
+permiten sobrescribir la recuperación; `--no-query-augmentation` y
+`--no-query-instruction` desactivan los dos apoyos de consulta. `--show-queries`
+muestra las consultas realmente utilizadas. Si la reformulación falla, `ask`
+avisa y continúa con la pregunta original. El CLI nunca activa ni muestra
+razonamiento.
 
 Las respuestas están cerradas al contexto documental recuperado: el prompt
 prohíbe usar conocimiento general o ejecutar peticiones ajenas a los documentos.

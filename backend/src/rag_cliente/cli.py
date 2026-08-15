@@ -95,8 +95,20 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument(
         "--top-k",
         type=int,
-        default=None,
-        help="Número máximo de páginas que se recuperarán.",
+        default=9,
+        help="Número máximo de páginas que se recuperarán (por defecto: 9).",
+    )
+    ask_parser.add_argument(
+        "--retrieval-mode",
+        choices=("vector", "hybrid", "bm25"),
+        default="vector",
+        help="Estrategia de recuperación (por defecto: vector).",
+    )
+    ask_parser.add_argument(
+        "--distance-type",
+        choices=("cosine", "l2"),
+        default="cosine",
+        help="Distancia vectorial (por defecto: cosine).",
     )
     ask_parser.add_argument("--tag", default=None, help="Filtra la recuperación por etiqueta.")
     ask_parser.add_argument(
@@ -115,7 +127,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Muestra todas las consultas utilizadas en la recuperación.",
     )
-    ask_parser.set_defaults(query_augmentation=True)
+    ask_parser.add_argument(
+        "--no-query-instruction",
+        dest="use_query_instruction",
+        action="store_false",
+        help="No añade la instrucción de recuperación al embedding de consulta.",
+    )
+    ask_parser.set_defaults(query_augmentation=True, use_query_instruction=True)
     ask_parser.add_argument(
         "--show-top-k",
         action="store_true",
@@ -308,6 +326,9 @@ def main() -> None:
             top_k=args.top_k,
             tag=args.tag,
             query_augmentation=args.query_augmentation,
+            retrieval_mode=args.retrieval_mode,
+            distance_type=args.distance_type,
+            use_query_instruction=args.use_query_instruction,
         )
         _print_query_diagnostics(result, args.show_queries)
         answer_parts: list[str] = []
@@ -327,6 +348,9 @@ def main() -> None:
             top_k=args.top_k,
             tag=args.tag,
             query_augmentation=args.query_augmentation,
+            retrieval_mode=args.retrieval_mode,
+            distance_type=args.distance_type,
+            use_query_instruction=args.use_query_instruction,
         )
         _print_query_diagnostics(result, args.show_queries)
         citations = result["citations"]

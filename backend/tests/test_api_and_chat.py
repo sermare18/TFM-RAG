@@ -267,6 +267,9 @@ class RetrievalModeTests(unittest.TestCase):
                 ["pregunta", "variante uno", "variante dos"],
                 top_k=5,
                 tag=None,
+                retrieval_mode=None,
+                distance_type=None,
+                use_query_instruction=None,
             )
 
     def test_generation_inputs_fall_back_when_augmentation_fails(self) -> None:
@@ -290,6 +293,33 @@ class RetrievalModeTests(unittest.TestCase):
                 ["pregunta"],
                 top_k=5,
                 tag=None,
+                retrieval_mode=None,
+                distance_type=None,
+                use_query_instruction=None,
+            )
+
+    def test_generation_inputs_forward_explicit_retrieval_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            pipeline = self.make_pipeline(Path(temp), "hybrid")
+            pipeline.client = Mock()
+            pipeline.client.rewrite_question_for_retrieval.return_value = "pregunta"
+            pipeline._retrieve = Mock(return_value=[])
+
+            pipeline._prepare_generation_inputs(
+                "pregunta",
+                top_k=9,
+                retrieval_mode="vector",
+                distance_type="cosine",
+                use_query_instruction=True,
+            )
+
+            pipeline._retrieve.assert_called_once_with(
+                ["pregunta"],
+                top_k=9,
+                tag=None,
+                retrieval_mode="vector",
+                distance_type="cosine",
+                use_query_instruction=True,
             )
 
 

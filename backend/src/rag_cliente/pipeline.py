@@ -565,6 +565,9 @@ class RagPipeline:
         messages: list[dict[str, str]] | None = None,
         tag: str | None = None,
         query_augmentation: bool = False,
+        retrieval_mode: Literal["vector", "bm25", "hybrid"] | None = None,
+        distance_type: Literal["l2", "cosine"] | None = None,
+        use_query_instruction: bool | None = None,
     ) -> dict[str, Any]:
         effective_top_k = top_k or self.settings.effective_retrieval_top_k
         query_variants: list[str] = []
@@ -587,6 +590,9 @@ class RagPipeline:
             queries,
             top_k=effective_top_k,
             tag=(tag or "").strip() or None,
+            retrieval_mode=retrieval_mode,
+            distance_type=distance_type,
+            use_query_instruction=use_query_instruction,
         )
 
         context_blocks: list[str] = []
@@ -618,6 +624,9 @@ class RagPipeline:
         tag: str | None = None,
         enable_reasoning: bool = False,
         query_augmentation: bool = False,
+        retrieval_mode: Literal["vector", "bm25", "hybrid"] | None = None,
+        distance_type: Literal["l2", "cosine"] | None = None,
+        use_query_instruction: bool | None = None,
     ) -> dict[str, Any]:
         inputs = self._prepare_generation_inputs(
             question,
@@ -625,6 +634,9 @@ class RagPipeline:
             messages,
             tag,
             query_augmentation=query_augmentation,
+            retrieval_mode=retrieval_mode,
+            distance_type=distance_type,
+            use_query_instruction=use_query_instruction,
         )
         with self.coordinator.acquire(
             "chat",
@@ -663,6 +675,9 @@ class RagPipeline:
         tag: str | None = None,
         enable_reasoning: bool = False,
         query_augmentation: bool = False,
+        retrieval_mode: Literal["vector", "bm25", "hybrid"] | None = None,
+        distance_type: Literal["l2", "cosine"] | None = None,
+        use_query_instruction: bool | None = None,
     ) -> dict[str, Any]:
         inputs = self._prepare_generation_inputs(
             question,
@@ -670,6 +685,9 @@ class RagPipeline:
             messages,
             tag,
             query_augmentation=query_augmentation,
+            retrieval_mode=retrieval_mode,
+            distance_type=distance_type,
+            use_query_instruction=use_query_instruction,
         )
         lease = self.coordinator.acquire(
             "chat",

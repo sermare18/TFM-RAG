@@ -44,8 +44,15 @@ class CliStreamingTests(unittest.TestCase):
                 top_k=None,
                 tag=None,
                 query_augmentation=False,
+                retrieval_mode=None,
+                distance_type=None,
+                use_query_instruction=None,
             ):
                 self.query_augmentation = query_augmentation
+                self.top_k = top_k
+                self.retrieval_mode = retrieval_mode
+                self.distance_type = distance_type
+                self.use_query_instruction = use_query_instruction
                 return {
                     "answer_stream": iter(
                         [
@@ -82,6 +89,10 @@ class CliStreamingTests(unittest.TestCase):
         self.assertIn("2. variante 1", output.getvalue())
         self.assertIn("3. variante 2", output.getvalue())
         self.assertTrue(fake.query_augmentation)
+        self.assertEqual(fake.top_k, 9)
+        self.assertEqual(fake.retrieval_mode, "vector")
+        self.assertEqual(fake.distance_type, "cosine")
+        self.assertTrue(fake.use_query_instruction)
 
     def test_show_top_k_prints_retrieved_page_and_chunk_when_sources_are_empty(self) -> None:
         match = {
@@ -105,6 +116,7 @@ class CliStreamingTests(unittest.TestCase):
                 top_k=None,
                 tag=None,
                 query_augmentation=False,
+                **_kwargs,
             ):
                 return {
                     "answer_stream": iter(
@@ -153,6 +165,7 @@ class CliStreamingTests(unittest.TestCase):
                 top_k=None,
                 tag=None,
                 query_augmentation=False,
+                **_kwargs,
             ):
                 self.query_augmentation = query_augmentation
                 return {
@@ -229,6 +242,36 @@ class CliStreamingTests(unittest.TestCase):
             parser.parse_args(["ask", "pregunta", "--show-reasoning"])
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("argumentos no reconocidos", errors.getvalue())
+
+    def test_ask_retrieval_defaults_can_be_overridden(self) -> None:
+        parser = build_parser()
+
+        defaults = parser.parse_args(["ask", "pregunta"])
+        self.assertEqual(defaults.top_k, 9)
+        self.assertEqual(defaults.retrieval_mode, "vector")
+        self.assertEqual(defaults.distance_type, "cosine")
+        self.assertTrue(defaults.query_augmentation)
+        self.assertTrue(defaults.use_query_instruction)
+
+        overridden = parser.parse_args(
+            [
+                "ask",
+                "pregunta",
+                "--top-k",
+                "4",
+                "--retrieval-mode",
+                "hybrid",
+                "--distance-type",
+                "l2",
+                "--no-query-augmentation",
+                "--no-query-instruction",
+            ]
+        )
+        self.assertEqual(overridden.top_k, 4)
+        self.assertEqual(overridden.retrieval_mode, "hybrid")
+        self.assertEqual(overridden.distance_type, "l2")
+        self.assertFalse(overridden.query_augmentation)
+        self.assertFalse(overridden.use_query_instruction)
 
     def test_help_keeps_long_option_and_description_on_the_same_line(self) -> None:
         parser = build_parser()
